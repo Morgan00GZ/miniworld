@@ -1,0 +1,54 @@
+﻿# ---------- Android / Gradle ----------
+*.apk
+*.aar
+*.aab
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/
+.gradle/
+build/
+local.properties
+proguard/
+captures/
+.externalNativeBuild/
+.cxx/
+*.jks
+*.keystore
+google-services.json
+lint/intermediates/
+lint/generated/
+lint/outputs/
+lint/tmp/
+lint/reports/
+*.hprof
+
+# ---------- IDE ----------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.navigation/
+vcs.xml
+
+# ---------- 日志 / 临时 ----------
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# ---------- Node / DSH 工具链 ----------
+node_modules/
+.npm/
+.pnpm-store/
+.dsh-cache/
+*.tsbuildinfo
+
+# ---------- 本地私密配置 ----------
+*.local
+.env
+.env.*
