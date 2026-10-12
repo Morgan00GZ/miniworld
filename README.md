@@ -13,7 +13,7 @@
 ## 一、这份仓库里有什么
 
 ```
-onestep-workbench/
+DSH-development-project-1/
 ├─ README.md                      本文件：总览、构建、快速开始
 ├─ docs/
 │  ├─ 01-可行性分析.md            能力边界、系统机制、必须真机验证的项
@@ -128,7 +128,7 @@ App 启动时会跑**能力自检**（`system/SystemProbe.kt`），自动落到�
 **双击 `tools\build-apk.bat` 即可。** 等价的命令行形式：
 
 ```powershell
-cd onestep-workbench
+cd DSH-development-project-1
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-build-env.ps1
 ```
 
@@ -170,7 +170,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-build-env.ps1 -S
 要求：JDK 17、Android SDK（`platforms;android-35`、`build-tools;35.0.0`）、Android Studio Ladybug 或更新。
 
 ```powershell
-cd onestep-workbench
+cd DSH-development-project-1
 
 # 1) SDK 路径（注意键名是小写的 sdk.dir）
 "sdk.dir=D:\\Android\\Sdk" | Out-File -Encoding ascii local.properties
