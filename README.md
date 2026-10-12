@@ -1,4 +1,4 @@
-# 一步工作台 · OneStep Workbench
+# 须弥芥子 · miniworld
 
 面向 **小米澎湃 OS（HyperOS）** 的「锤子一步 / OriginOS 原子工作台」式多应用同屏工作台。
 通过 **Shizuku** 借用 shell 身份驱动系统 **自由窗口（Freeform）**，把多个 App 铺成可编排的栅格，
@@ -13,7 +13,7 @@
 ## 一、这份仓库里有什么
 
 ```
-DSH-development-project-1/
+miniworld/
 ├─ README.md                      本文件：总览、构建、快速开始
 ├─ docs/
 │  ├─ 01-可行性分析.md            能力边界、系统机制、必须真机验证的项
@@ -128,7 +128,7 @@ App 启动时会跑**能力自检**（`system/SystemProbe.kt`），自动落到�
 **双击 `tools\build-apk.bat` 即可。** 等价的命令行形式：
 
 ```powershell
-cd DSH-development-project-1
+cd miniworld
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-build-env.ps1
 ```
 
@@ -170,7 +170,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-build-env.ps1 -S
 要求：JDK 17、Android SDK（`platforms;android-35`、`build-tools;35.0.0`）、Android Studio Ladybug 或更新。
 
 ```powershell
-cd DSH-development-project-1
+cd miniworld
 
 # 1) SDK 路径（注意键名是小写的 sdk.dir）
 "sdk.dir=D:\\Android\\Sdk" | Out-File -Encoding ascii local.properties
