@@ -1,4 +1,4 @@
-﻿# ---------- Android / Gradle ----------
+# ---------- Android / Gradle ----------
 *.apk
 *.aar
 *.aab
@@ -38,6 +38,8 @@ vcs.xml
 *.log
 *.tmp
 *.bak
+tools/probe-output/
+tools/*-log.txt
 .DS_Store
 Thumbs.db
 

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">须弥芥子</string>
+    <string name="notif_channel_name">工作台常驻</string>
+    <string name="notif_title">须弥芥子运行中</string>
+</resources>
