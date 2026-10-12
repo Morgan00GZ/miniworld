@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.onestep.workbench"
+    namespace = "com.miniworld"
     compileSdk = 35
 
     defaultConfig {

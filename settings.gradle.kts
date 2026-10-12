@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "OneStepWorkbench"
+rootProject.name = "miniworld"
 include(":app")
