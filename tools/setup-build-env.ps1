@@ -64,7 +64,7 @@ $GradleDir  = Join-Path $Root "gradle-$GradleVer"
 $DlDir      = Join-Path $Root 'downloads'
 
 $ScriptDir  = $PSScriptRoot
-$ProjDir    = Split-Path $ScriptDir -Parent          # onestep-workbench\
+$ProjDir    = Split-Path $ScriptDir -Parent          # 项目根（本仓库根目录）\
 $LogFile    = Join-Path $ScriptDir 'build-log.txt'
 $GradleLog  = Join-Path $ScriptDir 'gradle-log.txt'
 
@@ -160,7 +160,7 @@ Say "  OneStep Workbench - 一键编译环境"
 Say "=============================================================="
 Say "  项目目录  : $ProjDir"
 Say "  工具链目录: $Root"
-if (-not (Test-Path $ProjDir)) { Bad "找不到项目目录：$ProjDir（脚本应该待在 onestep-workbench\tools\ 里）"; exit 2 }
+if (-not (Test-Path $ProjDir)) { Bad "找不到项目目录：$ProjDir（脚本应该待在项目根的 tools\ 里）"; exit 2 }
 if (-not (Test-Path (Join-Path $ProjDir 'settings.gradle.kts'))) { Bad "项目目录里没有 settings.gradle.kts，路径不对：$ProjDir"; exit 2 }
 
 # 清掉上一次异常运行留下的垃圾目录：名字里带分号的一律是垃圾（正规工具链目录不会有分号）。

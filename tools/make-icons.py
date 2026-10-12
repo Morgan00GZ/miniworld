@@ -9,7 +9,7 @@
 import os
 from PIL import Image
 
-ROOT = r"D:\DeepSeek Harness\onestep-workbench"
+ROOT = r"D:\DeepSeek Harness\DSH-GitWorkspace\DSH-development-project-1"
 SRC = os.path.join(ROOT, "assets", "icons", "deepseek-whale-official.jpg")
 RES = os.path.join(ROOT, "app", "src", "main", "res")
 
