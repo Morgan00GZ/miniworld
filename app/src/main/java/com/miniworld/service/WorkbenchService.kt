@@ -121,9 +121,11 @@ class WorkbenchService : Service(), DockView.Listener {
             }
 
             ACTION_STOP -> {
-                controller.stop(intent.getBooleanExtra(EXTRA_KILL, false))
+                // Dock 立刻消失（用户看到的反馈不变），但服务等收工**跑完**再停：
+                // 以前这里立刻 stopSelf()，onDestroy 里的 shutdownNow() 会打断工作线程，
+                // 收工第一条 dumpsys 直接 InterruptedException，后台卡片摘不掉（真机事故 2026-10-13）。
                 teardownDock()
-                stopSelf()
+                controller.stop(intent.getBooleanExtra(EXTRA_KILL, false)) { stopSelf() }
             }
 
             else -> Log.i(TAG, "未知指令：${intent.action}")
@@ -246,10 +248,10 @@ class WorkbenchService : Service(), DockView.Listener {
         val window = controller.currentState().windows.firstOrNull { it.slotIndex == slotIndex } ?: return
         val pkg = window.packageName
         Thread {
-            val audit = KeepAlive.audit(pkg)
+            val audit = KeepAlive.audit(pkg, window.userId)
             val enable = !audit.inDeviceIdleWhitelist
-            KeepAlive.apply(pkg, enable)
-            toast("$pkg ${if (enable) "已加入挂机保活" else "已移出挂机保活"}")
+            KeepAlive.apply(pkg, window.userId, enable)
+            toast("$pkg${if (window.userId == 0) "" else "（分身）"} ${if (enable) "已加入挂机保活" else "已移出挂机保活"}")
         }.start()
     }
 

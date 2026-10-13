@@ -6,10 +6,13 @@ import android.os.Looper
 import android.util.Log
 import com.miniworld.apps.AppCatalog
 import com.miniworld.data.SceneStore
+import com.miniworld.model.AppTarget
 import com.miniworld.model.LayoutPreset
 import com.miniworld.model.LiveWindow
 import com.miniworld.model.Scene
 import com.miniworld.model.WorkbenchMode
+import com.miniworld.model.appTargets
+import com.miniworld.model.taskIdsOf
 import com.miniworld.service.DockView
 import com.miniworld.system.Diag
 import com.miniworld.system.FreeformController
@@ -174,7 +177,7 @@ class WorkbenchController(context: Context) {
             val target = targets.getOrElse(index) { targets.last() }
             // 用户手动浮出的那个小窗不要动，否则 6 秒后就被看门狗掰回小点
             if (window.packageName == current.manualOverlay) return@forEachIndexed
-            val task = TaskInspector.find(window.packageName) ?: return@forEachIndexed
+            val task = TaskInspector.find(window.packageName, window.userId) ?: return@forEachIndexed
             if (!task.isFreeform) return@forEachIndexed
             if (task.bounds != target) {
                 // 和弹出时一样走"先小后大"两步：单次 resize 在转屏之后经常不生效，
@@ -193,7 +196,7 @@ class WorkbenchController(context: Context) {
         // 但用户手动浮出小窗时要放过：他一浮出，主窗再抢前台就会把小窗顶掉（"闪现一下又消失"）。
         if (current.manualOverlay != null) return
         ordered.firstOrNull()?.let { main ->
-            TaskInspector.find(main.packageName)?.let { task ->
+            TaskInspector.find(main.packageName, main.userId)?.let { task ->
                 FreeformController.focusTask(task.taskId, main.component)
             }
         }
@@ -215,10 +218,9 @@ class WorkbenchController(context: Context) {
             val allAlive = runCatching {
                 val tasks = TaskInspector.listTasks()
                 scene.slots.all { slot ->
-                    tasks.any {
-                        it.packageName == slot.packageName &&
-                            (slot.userId == 0 || it.userId == slot.userId)
-                    }
+                    // 严格按「包名 + 用户号」比对：只要主机那一份还活着就判定"全都在"，
+                    // 会让分身那一份永远不被重新拉起。
+                    tasks.any { it.packageName == slot.packageName && it.userId == slot.userId }
                 }
             }.getOrDefault(false)
             if (allAlive) {
@@ -282,6 +284,7 @@ class WorkbenchController(context: Context) {
                     windows += LiveWindow(
                         slotIndex = index,
                         packageName = slot.packageName,
+                        userId = slot.userId,
                         component = component,
                         taskId = outcome.task.taskId,
                         bounds = bounds,
@@ -300,11 +303,12 @@ class WorkbenchController(context: Context) {
                 val ok = FreeformController.launchPlain(component)
                 log += "${if (ok) "✓" else "×"} ${slot.label} → 普通启动"
                 if (ok) {
-                    val task = TaskInspector.waitForTask(slot.packageName, 2_000)
+                    val task = TaskInspector.waitForTask(slot.packageName, slot.userId, 2_000)
                     if (task != null) {
                         windows += LiveWindow(
                             slotIndex = index,
                             packageName = slot.packageName,
+                            userId = slot.userId,
                             component = component,
                             taskId = task.taskId,
                             bounds = UNSET_BOUNDS,
@@ -345,7 +349,7 @@ class WorkbenchController(context: Context) {
                 }
                 // 每轮都把主窗压回最上面——用户看到的必须是第一个 App，而不是某个保活小点
                 val mainSlot = scene.slots.first()
-                TaskInspector.find(mainSlot.packageName)?.let { mainTask ->
+                TaskInspector.find(mainSlot.packageName, mainSlot.userId)?.let { mainTask ->
                     FreeformController.focusTask(mainTask.taskId, mainSlot.component)
                 }
                 if (drifted == 0 && attempt >= 3) break
@@ -356,12 +360,16 @@ class WorkbenchController(context: Context) {
                     val live = LiveWindow(
                         slotIndex = index,
                         packageName = slot.packageName,
+                        userId = slot.userId,
                         component = slot.component ?: catalog.find(slot.packageName)?.component,
                         taskId = fresh.taskId,
                         bounds = fresh.bounds ?: boundsList.getOrElse(index) { boundsList.last() },
                         launchedBy = "settled"
                     )
-                    val tracked = windows.indexOfFirst { it.packageName == slot.packageName }
+                    // 同一个包在主机和分身上各有一份时，只按包名匹配会互相覆盖。
+                    val tracked = windows.indexOfFirst {
+                        it.packageName == slot.packageName && it.userId == slot.userId
+                    }
                     if (tracked >= 0) windows[tracked] = live else windows += live
                 }
             }
@@ -379,7 +387,7 @@ class WorkbenchController(context: Context) {
         // 对"不在自由窗口里"的主位，直接普通启动一次，系统保证它到前台。
                 windows.minByOrNull { it.slotIndex }?.let { main ->
             val mainComponent = main.component ?: catalog.find(main.packageName)?.component
-            val mainTask = TaskInspector.find(main.packageName, null)
+            val mainTask = TaskInspector.find(main.packageName, main.userId)
             if (mainComponent != null && (mainTask == null || !mainTask.isFreeform)) {
                 FreeformController.launchPlain(mainComponent)
             }
@@ -399,7 +407,7 @@ class WorkbenchController(context: Context) {
         }
 
         // 保活是必需的，不提供开关：开工即把每个挂机应用加进白名单/活跃桶。
-        applyKeepAlive(windows.map { it.packageName }, enable = true)
+        applyKeepAlive(appTargets(windows, scene.slots), enable = true)
 
         // 开工后启动窗口看门狗（每 6 秒把跑偏的自由窗口拉回格子）
         main.removeCallbacks(reconcileTick)
@@ -432,7 +440,7 @@ class WorkbenchController(context: Context) {
 
         if (!onlyOne && slotIndex == primarySlot) {
             ordered.drop(1).forEach { other ->
-                TaskInspector.find(other.packageName)?.let { task ->
+                TaskInspector.find(other.packageName, other.userId)?.let { task ->
                     FreeformController.resizeTask(task.taskId, dotBounds())
                 }
             }
@@ -447,8 +455,9 @@ class WorkbenchController(context: Context) {
         }
         // 每次都重新按"包名 + 用户号"找任务：浮窗被全屏过、或转过屏之后旧任务号常已失效，
         // 继续拿它 resize 就会"再也接管不了"（真机 m01932 第三条）。
-        val slotUserId = current.scene?.slots
-            ?.firstOrNull { it.packageName == target.packageName }?.userId ?: 0
+        // 用户号直接取这个窗口自己的（记 LiveWindow 时带上了），不再按包名回场景里反查 ——
+        // 同名包在主机和手机分身上各有一份时，那种反查会挑到另一份。
+        val slotUserId = target.userId
         val task = TaskInspector.find(target.packageName, slotUserId)
         if (task == null) {
             update { it.copy(message = "找不到 ${target.packageName} 的窗口，请重新开工") }
@@ -505,7 +514,7 @@ class WorkbenchController(context: Context) {
         val current = state
         val pkg = current.manualOverlay ?: return@submit
         current.windows.filter { it.packageName == pkg }.forEach { window ->
-            TaskInspector.find(window.packageName, null)?.let { task ->
+            TaskInspector.find(window.packageName, window.userId)?.let { task ->
                 FreeformController.resizeTask(task.taskId, dotBounds())
             }
         }
@@ -549,13 +558,13 @@ class WorkbenchController(context: Context) {
 
     // ------------------------------------------------------------------ 保活
 
-    private fun applyKeepAlive(packages: List<String>, enable: Boolean): String {
-        if (packages.isEmpty()) return "没有可保活的应用"
+    private fun applyKeepAlive(targets: List<AppTarget>, enable: Boolean): String {
+        if (targets.isEmpty()) return "没有可保活的应用"
         val log = ArrayList<String>()
-        packages.forEach { pkg ->
-            val applied = KeepAlive.apply(pkg, enable)
+        targets.forEach { target ->
+            val applied = KeepAlive.apply(target.packageName, target.userId, enable)
             val failed = applied.filterNot { it.success }
-            log += "${if (failed.isEmpty()) "✓" else "!"} $pkg：${if (enable) "已保活" else "已撤销"}" +
+            log += "${if (failed.isEmpty()) "✓" else "!"} ${target.label}：${if (enable) "已保活" else "已撤销"}" +
                 if (failed.isEmpty()) "" else "（${failed.size} 项不支持）"
         }
         update { it.copy(keepAliveOn = enable, log = state.log + log, message = log.joinToString("；")) }
@@ -564,57 +573,65 @@ class WorkbenchController(context: Context) {
 
     // ------------------------------------------------------------------ 收工
 
-    /** @param killApps true 时连应用一起关掉；默认只把窗口收回全屏并撤销保活。 */
-    fun stop(killApps: Boolean = false) = submit("收工") {
-        main.removeCallbacks(reconcileTick)
-        val current = state
-        val log = ArrayList<String>()
+    /**
+     * @param killApps true 时连应用一起关掉；默认只把窗口收回全屏并撤销保活。
+     * @param onFinished 收工**真正跑完之后**才回调（服务用它来 stopSelf）。
+     *   以前服务是"提交完收工就立刻 stopSelf()"，`onDestroy` 里的 `shutdownNow()` 会把正在
+     *   干活的工作线程打断 —— 真机事故（2026-10-13）：收工第一条 `dumpsys` 直接
+     *   `InterruptedException`，查回来是空列表，后台卡片"摘掉 0/0"，用户看到卡片还在后台。
+     */
+    fun stop(killApps: Boolean = false, onFinished: (() -> Unit)? = null) = submit("收工") {
+        try {
+            main.removeCallbacks(reconcileTick)
+            val current = state
+            val log = ArrayList<String>()
+            // 「关闭 / 撤销保活」一律以「包名 + 用户号」为单位：同名包在主机和手机分身上各有一份，
+            // 只按包名下手会把两份一起关掉（真机事故：关闭 nrc 主机和分身同时被杀）。
+            val targets = appTargets(current.windows, current.scene?.slots ?: emptyList())
 
-        // 「关闭」= 直接结束须弥芥子启动的那个 App（含分身上的那份），而不只是停服务
-        if (killApps) {
-            val targets = (current.windows.map { it.packageName } +
-                (current.scene?.slots?.map { it.packageName } ?: emptyList())).distinct()
-            targets.forEach { pkg ->
-                val uid = current.scene?.slots?.firstOrNull { it.packageName == pkg }?.userId ?: 0
-                FreeformController.closePackage(pkg, uid)
-                log += "× $pkg 已结束（用户 $uid）"
-            }
-        }
-
-        if (current.mode == WorkbenchMode.FREEFORM_TILING) {
-            current.windows.forEach { window ->
-                if (killApps) {
-                    FreeformController.closePackage(window.packageName)
-                    log += "× ${window.packageName} 已关闭"
-                } else {
+            // 「关闭」= 直接结束须弥芥子启动的那个 App（含分身上的那份），而不只是停服务
+            if (killApps) {
+                targets.forEach { target ->
+                    // 顺手把启动时记下的任务号带过去：现场查询万一被打断，还能靠它把卡片摘掉。
+                    FreeformController.closePackage(
+                        target.packageName,
+                        target.userId,
+                        taskIdsOf(target, current.windows)
+                    )
+                    log += "× ${target.label} 已结束"
+                }
+            } else if (current.mode == WorkbenchMode.FREEFORM_TILING) {
+                current.windows.forEach { window ->
                     FreeformController.toFullscreen(window.taskId, window.component)
                     log += "↗ ${window.packageName} 已恢复全屏"
                 }
             }
-        } else if (killApps) {
-            current.windows.forEach { FreeformController.closePackage(it.packageName) }
-            log += "已关闭所有应用"
-        }
 
-        if (current.keepAliveOn) {
-            applyKeepAlive(current.windows.map { it.packageName }, enable = false)
-            log += "保活已撤销"
-        }
+            if (current.keepAliveOn) {
+                applyKeepAlive(targets, enable = false)
+                log += "保活已撤销"
+            }
 
-        update {
-            it.copy(
-                running = false,
-                windows = emptyList(),
-                keepAliveOn = false,
-                log = log,
-                message = "已收工"
-            )
+            update {
+                it.copy(
+                    running = false,
+                    windows = emptyList(),
+                    keepAliveOn = false,
+                    log = log,
+                    message = "已收工"
+                )
+            }
+        } finally {
+            // 无论中间哪一步抛异常都要回调，否则服务会永远留在"前台服务"里退不出去。
+            onFinished?.let { main.post(it) }
         }
     }
 
     fun shutdown() {
         main.removeCallbacks(reconcileTick)
-        runCatching { worker.shutdownNow() }
+        // 温和关闭：让已经在跑的收工动作把话说完。`shutdownNow()` 会打断工作线程，
+        // 真机事故：收工里的 dumpsys 被打断成 InterruptedException，后台卡片摘不掉。
+        runCatching { worker.shutdown() }
     }
 
     private companion object {

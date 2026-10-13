@@ -20,26 +20,37 @@ object KeepAlive {
 
     data class Step(val key: String, val label: String, val command: String)
 
-    private fun enableSteps(pkg: String): List<Step> = listOf(
+    /**
+     * 保活命令：**全部按 Android 用户号下发**。
+     *
+     * 原因和关闭一样：手机分身里的应用与主系统里的那份包名相同，不带 `--user` 时命令落在
+     * "当前用户"上，分身那一份就完全没被保活（而用户以为自己两份都挂上了）。
+     *
+     * 例外是 `cmd deviceidle whitelist` —— 电池优化白名单是全机的，命令本身没有 `--user` 维度。
+     */
+    private fun enableSteps(pkg: String, userId: Int): List<Step> = listOf(
         Step("deviceidle", "加入电池优化白名单", "cmd deviceidle whitelist +$pkg"),
-        Step("inactive", "标记为活跃应用", "am set-inactive $pkg false"),
-        Step("bucket", "待机桶 → active", "am set-standby-bucket $pkg active"),
-        Step("runAny", "允许后台运行（RUN_ANY_IN_BACKGROUND）", "cmd appops set $pkg RUN_ANY_IN_BACKGROUND allow"),
-        Step("runBg", "允许后台运行（RUN_IN_BACKGROUND）", "cmd appops set $pkg RUN_IN_BACKGROUND allow")
+        Step("inactive", "标记为活跃应用", "am set-inactive --user $userId $pkg false"),
+        Step("bucket", "待机桶 → active", "am set-standby-bucket --user $userId $pkg active"),
+        Step("runAny", "允许后台运行（RUN_ANY_IN_BACKGROUND）", "cmd appops set --user $userId $pkg RUN_ANY_IN_BACKGROUND allow"),
+        Step("runBg", "允许后台运行（RUN_IN_BACKGROUND）", "cmd appops set --user $userId $pkg RUN_IN_BACKGROUND allow")
     )
 
-    private fun disableSteps(pkg: String): List<Step> = listOf(
+    private fun disableSteps(pkg: String, userId: Int): List<Step> = listOf(
         Step("deviceidle", "移出电池优化白名单", "cmd deviceidle whitelist -$pkg"),
-        Step("inactive", "清除活跃标记", "am set-inactive $pkg true"),
-        Step("bucket", "待机桶恢复默认", "am set-standby-bucket $pkg default"),
-        Step("runAny", "撤销后台运行（RUN_ANY_IN_BACKGROUND）", "cmd appops set $pkg RUN_ANY_IN_BACKGROUND default"),
-        Step("runBg", "撤销后台运行（RUN_IN_BACKGROUND）", "cmd appops set $pkg RUN_IN_BACKGROUND default")
+        Step("inactive", "清除活跃标记", "am set-inactive --user $userId $pkg true"),
+        // 故意**没有**"待机桶恢复默认"这一步：这台 ROM 的 `am set-standby-bucket` 只认
+        // active|working_set|frequent|rare|restricted，没有 `default`
+        // （实测 exit=255 "Unknown bucket: default"），而硬塞一个 `rare` 等于主动把 App 降级。
+        // 系统没提供"恢复默认"，就不假装能恢复：保活时设的 active 由系统按使用情况自己回收。
+        Step("runAny", "撤销后台运行（RUN_ANY_IN_BACKGROUND）", "cmd appops set --user $userId $pkg RUN_ANY_IN_BACKGROUND default"),
+        Step("runBg", "撤销后台运行（RUN_IN_BACKGROUND）", "cmd appops set --user $userId $pkg RUN_IN_BACKGROUND default")
     )
 
     data class Applied(val step: Step, val result: ShellResult, val success: Boolean)
 
-    fun apply(pkg: String, enable: Boolean): List<Applied> {
-        val steps = if (enable) enableSteps(pkg) else disableSteps(pkg)
+    fun apply(pkg: String, userId: Int, enable: Boolean): List<Applied> {
+        val steps = if (enable) enableSteps(pkg, userId) else disableSteps(pkg, userId)
         return steps.map { step ->
             val result = ShellRunner.exec(step.command)
             if (!result.ok) {
@@ -70,11 +81,11 @@ object KeepAlive {
             }
     }
 
-    /** 只读审计，用于 Dock 长按复查与「收工后复查」。 */
-    fun audit(pkg: String): Audit {
+    /** 只读审计，用于 Dock 长按复查与「收工后复查」。按用户号读——分身那份和主机那份是两套状态。 */
+    fun audit(pkg: String, userId: Int): Audit {
         val whitelist = ShellRunner.exec("dumpsys deviceidle whitelist").stdout
-        val runAny = ShellRunner.exec("cmd appops get $pkg RUN_ANY_IN_BACKGROUND").stdout
-        val bucket = ShellRunner.exec("am get-standby-bucket $pkg").stdout
+        val runAny = ShellRunner.exec("cmd appops get --user $userId $pkg RUN_ANY_IN_BACKGROUND").stdout
+        val bucket = ShellRunner.exec("am get-standby-bucket --user $userId $pkg").stdout
         val freezer = ShellRunner.exec("settings get global cached_apps_freezer").stdout
 
         return Audit(
