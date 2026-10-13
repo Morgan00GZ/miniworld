@@ -1,0 +1,3 @@
+@echo off
+rem Wrapper so double-click / cmd works even with a Restricted execution policy.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0doc-sync.ps1" %*
