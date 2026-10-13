@@ -116,7 +116,7 @@ class WorkbenchController(context: Context) {
      * 只在"小点模式 + 竖屏"动手：浮出态不碰（那时它本来就该拿着焦点）；横屏/旋转期间不介入
      * （那条路会由系统重排 + forceReconcile 自己好）。
      */
-    private fun handBackStolenFocus() {
+    private fun handBackStolenFocus(dump: String) {
         if (state.manualOverlay != null) return
         if (appContext.resources.configuration.orientation ==
             android.content.res.Configuration.ORIENTATION_LANDSCAPE
@@ -129,7 +129,7 @@ class WorkbenchController(context: Context) {
             ).toSet()
         if (managed.isEmpty()) return
 
-        val snap = TaskInspector.focusSnapshot()
+        val snap = TaskInspector.focusSnapshot(dump)
         val focusedPkg = snap.focusedPackage ?: return
         if (!managed.contains(focusedPkg)) return
         val target = snap.resumedTaskId ?: return
@@ -141,10 +141,24 @@ class WorkbenchController(context: Context) {
         FreeformController.focusTask(target, null)
     }
 
+    /** 看门狗跑了多少拍。只用来打低频心跳日志（S4 降噪后靠它确认"还活着"）。 */
+    private var tickCount = 0L
+
     private val reconcileTick = object : Runnable {
         override fun run() {
             if (!state.running) return
             submit("校正窗口") { reconcileBounds() }
+            // S4：日志降噪后不再逐条命令写盘，改成 5 分钟一条心跳（不查也 ping，零命令开销）。
+            tickCount++
+            if (tickCount % HEARTBEAT_TICKS == 0L) {
+                val s = state
+                Diag.log(
+                    TAG,
+                    "看门狗心跳：第 $tickCount 拍（约 ${tickCount * 2 / 60} 分钟），" +
+                        "窗口=${s.windows.joinToString { "${it.packageName}@${it.userId}" }}，" +
+                        "模式=${s.mode}，浮窗=${s.manualOverlay ?: "无"}"
+                )
+            }
             main.postDelayed(this, 2_000)
         }
     }
@@ -156,6 +170,12 @@ class WorkbenchController(context: Context) {
         val current = state
         val scene = current.scene ?: return
         if (current.mode != WorkbenchMode.FREEFORM_TILING) return
+
+        // S1：一拍只取一份任务列表，下面所有判断都复用这一份。
+        // 原来一拍要 dump 3 次（find / focusSnapshot / 末尾兜底 find），每次都是一条
+        // `dumpsys activity activities`（真机实测约 0.01 s、72 KB，还要经 Shizuku 起一个 sh）。
+        // 拿不到就整拍跳过：宁可这一拍什么都不做，也不能把"没查到"当成"任务不见了"。
+        val dump = TaskInspector.dumpOrNull() ?: return
 
         val available = ScreenMetrics.read(appContext)
             .availableBounds(rightInset = DockView.widthPx(appContext))
@@ -177,7 +197,8 @@ class WorkbenchController(context: Context) {
             val target = targets.getOrElse(index) { targets.last() }
             // 用户手动浮出的那个小窗不要动，否则 6 秒后就被看门狗掰回小点
             if (window.packageName == current.manualOverlay) return@forEachIndexed
-            val task = TaskInspector.find(window.packageName, window.userId) ?: return@forEachIndexed
+            val task = TaskInspector.find(window.packageName, window.userId, dump)
+                ?: return@forEachIndexed
             if (!task.isFreeform) return@forEachIndexed
             if (task.bounds != target) {
                 // 和弹出时一样走"先小后大"两步：单次 resize 在转屏之后经常不生效，
@@ -190,7 +211,7 @@ class WorkbenchController(context: Context) {
         }
 
         // 焦点被别的全屏任务抢走 → 还给用户真正在看的那个任务：只发一条 am task focus，几何不动。
-        handBackStolenFocus()
+        handBackStolenFocus(dump)
 
         // 把**当前应该在前台的那个**重新置顶（不是固定第一个）。
         // 但用户手动浮出小窗时要放过：他一浮出，主窗再抢前台就会把小窗顶掉（"闪现一下又消失"）。
@@ -203,7 +224,7 @@ class WorkbenchController(context: Context) {
         // 所以这里只在"确实看不见"时才补一次兜底。多窗口平铺档位维持原样。
         val singleDot = ordered.size == 1
         ordered.firstOrNull()?.let { main ->
-            TaskInspector.find(main.packageName, main.userId)?.let { task ->
+            TaskInspector.find(main.packageName, main.userId, dump)?.let { task ->
                 if (singleDot && task.visible) return@let
                 FreeformController.focusTask(task.taskId, main.component)
             }
@@ -665,5 +686,8 @@ class WorkbenchController(context: Context) {
         /** 隐形小点相对**真实屏幕**右下角的外移量（像素）：整块落在屏幕外，屏幕上什么都看不见。 */
         const val DOT_OUT_X = 16
         const val DOT_OUT_Y = 34
+
+        /** 看门狗心跳日志的间隔（拍）：150 拍 × 2 秒 = 5 分钟一条。 */
+        const val HEARTBEAT_TICKS = 150L
     }
 }
