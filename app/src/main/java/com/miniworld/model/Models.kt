@@ -86,6 +86,13 @@ data class Scene(
 data class LiveWindow(
     val slotIndex: Int,
     val packageName: String,
+    /**
+     * 这个窗口属于哪个 Android 用户：0 = 主系统，999 = 手机分身。
+     *
+     * 必须跟着窗口一起记下来：运行时的关窗/收起/找任务都只能靠它区分同名包的两份实例，
+     * 少了它就只能"按包名"下手 —— 真机事故：关闭 nrc 把主机和分身两份一起杀了。
+     */
+    val userId: Int = 0,
     val component: String?,
     val taskId: Int,
     val bounds: Bounds,

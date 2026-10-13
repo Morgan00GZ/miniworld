@@ -130,6 +130,10 @@ object FreeformController {
         return "am start $userArg-n $comp$extra"
     }
 
+    /** 组件串里 "@用户号" 对应的 Android 用户号；没写后缀就是主系统 0。 */
+    private fun userOf(component: String): Int =
+        component.substringAfterLast('@', "").toIntOrNull() ?: 0
+
     fun launchInFreeform(
         component: String,
         bounds: Bounds,
@@ -137,6 +141,9 @@ object FreeformController {
         preferredStrategy: String? = null
     ): LaunchOutcome {
         val pkg = component.substringBefore('/')
+        // 找任务也必须带用户号：同名包在主机和手机分身上各有一份，
+        // 只按包名会等到/抓到另一份，后面的摆位就作用在错误的实例上。
+        val userId = userOf(component)
         val log = ArrayList<String>()
 
         // 上次已经证明"App 内启动这条路在本机走不通"时，就别让用户再看一遍黑屏
@@ -150,7 +157,7 @@ object FreeformController {
         } else {
             log += "[1] startActivity + setLaunchBounds ${bounds.toRect()}"
             if (launchFromApp(context, component, bounds)) {
-                val task = TaskInspector.waitForTask(pkg, 2_500)
+                val task = TaskInspector.waitForTask(pkg, userId, 2_500)
                 if (task != null && (task.isFreeform || boundsClose(task.bounds, bounds))) {
                     return LaunchOutcome(true, "app-launch-bounds", ensureBounds(task, bounds, log), log)
                 }
@@ -170,7 +177,7 @@ object FreeformController {
             val result = ShellRunner.exec(cmd)
             log += "    exit=${result.exitCode} ${result.firstLine()}"
             if (!result.contains("Error") && !result.contains("Exception")) {
-                val task = waitForFreeformTask(pkg, 2_500)
+                val task = waitForFreeformTask(pkg, userId, 2_500)
                 if (task != null) {
                     return LaunchOutcome(true, "shell-windowing-mode", ensureBounds(task, bounds, log), log)
                 }
@@ -184,7 +191,7 @@ object FreeformController {
         log += "[3] am start（全屏）后 resize"
         val plain = ShellRunner.exec(amStart(component))
         log += "    exit=${plain.exitCode} ${plain.firstLine()}"
-        val task = TaskInspector.waitForTask(pkg, 3_000)
+        val task = TaskInspector.waitForTask(pkg, userId, 3_000)
         if (task != null) {
             val resized = resizeTask(task.taskId, bounds)
             log += "    resize $task.taskId -> ${bounds.toResizeArgs()} : $resized"
@@ -203,7 +210,7 @@ object FreeformController {
         )
         log += "    exit=${broadcast.exitCode} ${broadcast.firstLine()}"
         if (!broadcast.contains("Error") && broadcast.contains("Broadcast completed")) {
-            val vendorTask = TaskInspector.waitForTask(pkg, 2_500)
+            val vendorTask = TaskInspector.waitForTask(pkg, userId, 2_500)
             val placed = vendorTask?.let { ensureBounds(it, bounds, log) }
             return LaunchOutcome(placed != null, "vendor-broadcast", placed, log)
         }
@@ -230,14 +237,15 @@ object FreeformController {
         true
     }.onFailure { Log.w(TAG, "App 内启动失败：${it.message}") }.getOrDefault(false)
 
-    private fun waitForFreeformTask(pkg: String, timeoutMs: Long): TaskInfo? {
+    private fun waitForFreeformTask(pkg: String, userId: Int, timeoutMs: Long): TaskInfo? {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            val task = TaskInspector.listTasks().firstOrNull { it.packageName == pkg }
+            val task = TaskInspector.listTasks()
+                .firstOrNull { it.packageName == pkg && it.userId == userId }
             if (task != null && task.isFreeform) return task
             Thread.sleep(250)
         }
-        return TaskInspector.listTasks().firstOrNull { it.packageName == pkg }
+        return TaskInspector.listTasks().firstOrNull { it.packageName == pkg && it.userId == userId }
     }
 
     /**
@@ -339,11 +347,23 @@ object FreeformController {
      * 顺序有讲究：任务 id 必须在 force-stop **之前**取（force-stop 会把任务从活动列表里清掉，
      * 之后就取不到了）；而 `am stack remove` 在 force-stop 之后照样有效（已实测）。
      */
-    fun closePackage(packageName: String, userId: Int = 0): Boolean {
-        val taskIds = TaskInspector.listTasks()
-            .filter { it.packageName == packageName && (userId == 0 || it.userId == userId) }
-            .map { it.taskId }
-        val result = ShellRunner.exec("am force-stop ${if (userId != 0) "--user $userId " else ""}$packageName")
+    fun closePackage(
+        packageName: String,
+        userId: Int,
+        recordedTaskIds: List<Int> = emptyList()
+    ): Boolean {
+        // 用户号**必填、且一定要写进命令**：退化成不带 `--user` 的 `am force-stop` 时，
+        // 主系统和手机分身上的两份会一起被杀（真机事故：关闭 nrc 两份全关）。
+        //
+        // 任务号优先现场查（结果最准）；只有"这条命令根本没跑成"才退回启动时记下的。
+        // 真机事故（2026-10-13）：收工把工作线程打断 → dumpsys 抛 InterruptedException →
+        // 现场查询失败被当成"没有卡片" → 日志"摘掉后台卡片 0/0"，卡片留在后台。
+        val live = TaskInspector.listTasksOrNull()
+            ?.filter { it.packageName == packageName && it.userId == userId }
+            ?.map { it.taskId }
+        val fallback = live == null
+        val taskIds = (live ?: recordedTaskIds).distinct()
+        val result = ShellRunner.exec("am force-stop --user $userId $packageName")
         var removed = 0
         for (id in taskIds) {
             val r = ShellRunner.exec("am stack remove $id")
@@ -355,7 +375,8 @@ object FreeformController {
         }
         Diag.log(
             TAG,
-            "关闭 $packageName（用户 $userId）：force-stop ok=${result.ok}，摘掉后台卡片 $removed/${taskIds.size}"
+            "关闭 $packageName（用户 $userId）：force-stop ok=${result.ok}，摘掉后台卡片 $removed/${taskIds.size}" +
+                if (fallback) "（现场查不到，用的是启动时记录的任务号）" else ""
         )
         return result.ok
     }

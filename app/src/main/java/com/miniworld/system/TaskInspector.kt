@@ -72,10 +72,34 @@ object TaskInspector {
 
     fun dump(): String = ShellRunner.exec("dumpsys activity activities", 15_000).stdout
 
-    fun listTasks(): List<TaskInfo> = parse(dump())
+    fun listTasks(): List<TaskInfo> = listTasksOrNull() ?: emptyList()
 
-    fun find(packageName: String, userId: Int? = null): TaskInfo? =
-        listTasks().firstOrNull { it.packageName == packageName && (userId == null || it.userId == userId) }
+    /**
+     * 同 [listTasks]，但区分"确实没有任务"与"这条命令没跑成"。
+     *
+     * 为什么必须区分：收工时服务会把自己停掉，`dumpsys` 有可能被打断（真机事故：
+     * `InterruptedException` → stdout 为空 → 解析出 0 个任务 → 后台卡片"摘掉 0/0"，
+     * 卡片留在后台）。返回 null 让调用方有机会退回"启动时记下的任务号"，
+     * 而不是把"没查到"误当成"没有卡片"。
+     */
+    fun listTasksOrNull(): List<TaskInfo>? {
+        val result = ShellRunner.exec("dumpsys activity activities", 15_000)
+        if (!result.ok) {
+            Log.w(TAG, "任务列表查询失败：${result.firstLine()}")
+            return null
+        }
+        return parse(result.stdout)
+    }
+
+    /**
+     * 按「包名 + Android 用户号」找任务。
+     *
+     * userId **必填**：同一个包在主机和手机分身上各有一份时包名完全一样，只按包名找
+     * 会随机命中另一份（真机事故：关闭 nrc 时主机与分身两份一起被杀）。确实不关心用户时，
+     * 也要显式写出你要的那一个，不要退化成"随便一个"。
+     */
+    fun find(packageName: String, userId: Int): TaskInfo? =
+        listTasks().firstOrNull { it.packageName == packageName && it.userId == userId }
 
     fun parse(dump: String): List<TaskInfo> {
         if (dump.isBlank()) return emptyList()
@@ -212,11 +236,16 @@ object TaskInspector {
         )
     }
 
-    /** 轮询等待某个包的任务出现。返回 null 表示超时。 */
-    fun waitForTask(packageName: String, timeoutMs: Long = 3_000, intervalMs: Long = 250): TaskInfo? {
+    /** 轮询等待某个包在**指定用户下**的任务出现。返回 null 表示超时。 */
+    fun waitForTask(
+        packageName: String,
+        userId: Int,
+        timeoutMs: Long = 3_000,
+        intervalMs: Long = 250
+    ): TaskInfo? {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
-            val task = find(packageName)
+            val task = find(packageName, userId)
             if (task != null) return task
             Thread.sleep(intervalMs)
         }

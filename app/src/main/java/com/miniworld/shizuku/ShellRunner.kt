@@ -85,9 +85,12 @@ object ShellRunner {
         } catch (t: Throwable) {
             val real = unwrap(t)
             Log.w(TAG, "执行失败：$command", real)
+            // 被中断和真报错要分开写：中断是"我们自己把线程掐了"，看日志的人不该把它
+            // 当成 ROM 不支持（真机事故：收工打断 dumpsys，日志看上去像"查不到任务"）。
+            val what = if (real is InterruptedException) "命令被中断（线程被打断）" else "命令抛异常"
             Diag.log(
                 TAG,
-                "命令抛异常：$command\n  ${real.javaClass.name}: ${real.message}" +
+                "$what：$command\n  ${real.javaClass.name}: ${real.message}" +
                     "\n  cause=${real.cause?.javaClass?.name}: ${real.cause?.message}"
             )
             ShellResult(command, "", "${real.javaClass.simpleName}: ${real.message}", -1, false)
