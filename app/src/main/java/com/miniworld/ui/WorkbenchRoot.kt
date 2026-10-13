@@ -97,12 +97,6 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
             .padding(20.dp)
     ) {
         Text("须弥芥子", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
-        Text(
-            "一个 App 挂在后台跑 · 一键浮出看/操作",
-            fontSize = 12.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
 
         Spacer(Modifier.height(24.dp))
         Text("当前挂机应用", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
