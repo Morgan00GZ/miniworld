@@ -95,7 +95,10 @@ object ShellRunner {
             )
             ShellResult(command, "", "${real.javaClass.simpleName}: ${real.message}", -1, false)
         }
-        Diag.log(TAG, summarize(result))
+        // S4：正常命令不再逐条写盘。原来看门狗每 2 秒跑 3 条 dumpsys 就写 3 行，
+        // 挂机几十分钟就把 diag.log 顶到 512 KB 上限、整个文件被删重来，反而看不到历史。
+        // 失败/超时照旧写全 —— 排障要的正是这些。
+        if (!result.ok) Diag.log(TAG, summarize(result))
         return result
     }
 

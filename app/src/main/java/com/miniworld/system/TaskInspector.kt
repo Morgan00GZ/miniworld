@@ -72,6 +72,21 @@ object TaskInspector {
 
     fun dump(): String = ShellRunner.exec("dumpsys activity activities", 15_000).stdout
 
+    /**
+     * 同 [dump]，但命令没跑成时返回 null。
+     *
+     * 用途：看门狗一拍只取一份任务列表（S1：原来一拍要 dump 3 次），这一份拿不到时
+     * **整拍跳过** —— 绝不能把"没查到"当成"任务都不见了"去动窗口。
+     */
+    fun dumpOrNull(): String? {
+        val result = ShellRunner.exec("dumpsys activity activities", 15_000)
+        if (!result.ok) {
+            Log.w(TAG, "任务列表查询失败（本拍跳过）：${result.firstLine()}")
+            return null
+        }
+        return result.stdout
+    }
+
     fun listTasks(): List<TaskInfo> = listTasksOrNull() ?: emptyList()
 
     /**
@@ -98,8 +113,8 @@ object TaskInspector {
      * 会随机命中另一份（真机事故：关闭 nrc 时主机与分身两份一起被杀）。确实不关心用户时，
      * 也要显式写出你要的那一个，不要退化成"随便一个"。
      */
-    fun find(packageName: String, userId: Int): TaskInfo? =
-        listTasks().firstOrNull { it.packageName == packageName && it.userId == userId }
+    fun find(packageName: String, userId: Int, dump: String = dump()): TaskInfo? =
+        parse(dump).firstOrNull { it.packageName == packageName && it.userId == userId }
 
     fun parse(dump: String): List<TaskInfo> {
         if (dump.isBlank()) return emptyList()
