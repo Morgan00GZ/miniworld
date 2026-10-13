@@ -61,13 +61,16 @@ class LayoutEngineTest {
     }
 
     /**
-     * 最终形态的具体形状：槽位 0 占满可用区，其余是**右下角 2×2 像素**的小点。
+     * 最终形态的具体形状：槽位 0 占满可用区，其余是 2×2 像素的小点。
+     *
+     * 不传 offscreenDot 时退回"可用区右下角贴边"（旧行为，只作拿不到真实屏幕尺寸时的兜底）；
+     * 真机上小点由调用方放到**屏幕外**，见下一个用例。
      *
      * 这里不断言"两两不重叠"——小点是故意压在主窗右下角上的（那样才"看不见"），
      * 重叠在这里是设计要求，不是缺陷。
      */
     @Test
-    fun `solo keepalive gives one full area plus 2x2 dots at bottom right corner`() {
+    fun `solo keepalive falls back to bottom right corner dots without an offscreen target`() {
         val result = LayoutEngine.layout(area, preset, 3)
         assertEquals(3, result.size)
         assertEquals(area, result[0])
@@ -77,6 +80,20 @@ class LayoutEngineTest {
             assertEquals("小点没贴右边：$dot", area.right, dot.right)
             assertEquals("小点没贴下边：$dot", area.bottom, dot.bottom)
         }
+    }
+
+    /**
+     * 2026-10-13 真机实测：小点只要还落在屏幕内，系统给自由窗口画的那圈装饰就会露出屏幕一角
+     * （用户原话"大半在屏幕外也是坏掉的"）。所以调用方会把小点整块放到**屏幕外**，
+     * 这里断言这个位置被原样用在所有非 0 槽位上。
+     */
+    @Test
+    fun `solo keepalive uses the offscreen dot position when given`() {
+        val offscreen = Bounds(area.right + 172, area.bottom + 99, area.right + 174, area.bottom + 101)
+        val result = LayoutEngine.layout(area, preset, 3, offscreen)
+        assertEquals(3, result.size)
+        assertEquals(area, result[0])
+        assertEquals(listOf(offscreen, offscreen), result.drop(1))
     }
 
     @Test

@@ -30,36 +30,45 @@ object LayoutEngine {
         bottom = (height - bottomInset).coerceAtLeast(topInset)
     )
 
-    fun layout(available: Bounds, preset: LayoutPreset, slotCount: Int): List<Bounds> {
+    /**
+     * @param offscreenDot 隐形小点该待的位置（**屏幕外**，由调用方按真实屏幕尺寸算好）。
+     *   传 null 时退回"可用区右下角贴边"，只作为拿不到真实屏幕尺寸时的兜底。
+     */
+    fun layout(
+        available: Bounds,
+        preset: LayoutPreset,
+        slotCount: Int,
+        offscreenDot: Bounds? = null
+    ): List<Bounds> {
         val n = slotCount.coerceAtLeast(1)
         if (!available.isValid) return List(n) { available }
         return when (preset) {
-            LayoutPreset.SOLO_KEEPALIVE -> soloKeepAlive(available, n)
+            LayoutPreset.SOLO_KEEPALIVE -> soloKeepAlive(available, n, offscreenDot)
         }
     }
 
     /**
      * 「一个全屏 + 其余隐形保活」：
      *  - 槽位 0 = 整个可用区（用户看到的那一个全屏窗口）
-     *  - 槽位 1..n-1 = 右下角一个 2×2 像素的小点
+     *  - 槽位 1..n-1 = 一个 2×2 像素的小点（2026-10-13 起**默认放到屏幕外**）
      *
      * 为什么留小点而不是把 App 关掉：Android 的 multi-resume 是"**窗口可见**就 RESUMED"。
      * 缩到 2×2 像素仍然算"在屏幕上"，进程继续跑、画面继续渲染，而占用的视觉空间是 0；
      * 点 Dock 图标把某个 App 换到槽位 0，它就变成那个全屏的。
      * 用户明确要求过：「小窗真的不能不出现吗……保活在后台，用按钮切换回前台就行」。
      *
-     * 注意：小点是**故意压在槽位 0 之上**的（所以两者"重叠"是设计，不是缺陷）。
+     * 为什么小点要放到**屏幕外**（真机实测）：这台 ROM 会给可见的自由窗口画一圈系统装饰
+     * （记录里的"小角"）。小点只要还落在屏幕内，那圈装饰就会露出屏幕一角；用户明确说过
+     * "大半在屏幕外也是坏掉的"。整块挪到屏幕外后屏幕彻底干净，而系统的"可见"判定看窗口状态
+     * 不看坐标——任务仍 `visible=true`、进程仍 TOP、不被冻结。
      */
-    private fun soloKeepAlive(a: Bounds, n: Int): List<Bounds> {
-        val dot = 2
-        return List(n) { index ->
-            if (index == 0) a
-            else Bounds(
-                left = (a.right - dot).coerceAtLeast(a.left),
-                top = (a.bottom - dot).coerceAtLeast(a.top),
-                right = a.right,
-                bottom = a.bottom
-            )
-        }
+    private fun soloKeepAlive(a: Bounds, n: Int, offscreenDot: Bounds?): List<Bounds> {
+        val dot = offscreenDot ?: Bounds(
+            left = (a.right - 2).coerceAtLeast(a.left),
+            top = (a.bottom - 2).coerceAtLeast(a.top),
+            right = a.right,
+            bottom = a.bottom
+        )
+        return List(n) { index -> if (index == 0) a else dot }
     }
 }
