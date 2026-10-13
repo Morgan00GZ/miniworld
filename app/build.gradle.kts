@@ -12,8 +12,8 @@ android {
         applicationId = "com.miniworld"
         minSdk = 30
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.02"
+        versionCode = 4
+        versionName = "1.1"
     }
 
     buildTypes {

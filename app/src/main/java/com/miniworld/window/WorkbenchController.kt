@@ -25,7 +25,7 @@ import java.util.concurrent.Executors
  * 工作台编排器。
  *
  * 三件事：
- *  1. 按场景把应用拉起来（走 FreeformController 的策略链），并缩成右下角 2×2 的隐形小点
+ *  1. 按场景把应用拉起来（走 FreeformController 的策略链），并缩成**屏幕外** 2×2 的隐形小点
  *  2. 运行期间用 LayoutEngine 算出的坐标把窗口钉在小点上（`am task resize`）；
  *     焦点被别的全屏任务抢走时，把它还给用户真正在看的那个任务（`am task focus`）
  *  3. Dock 点按 = 在"隐形小点"和"约 3/4 屏浮窗"之间切换，**不重新启动 App**
@@ -171,7 +171,7 @@ class WorkbenchController(context: Context) {
         val targets = if (ordered.size == 1) {
             listOf(dotBounds())
         } else {
-            LayoutEngine.layout(available, current.preset, ordered.size)
+            LayoutEngine.layout(available, current.preset, ordered.size, offscreenDot = dotBounds())
         }
         ordered.forEachIndexed { index, window ->
             val target = targets.getOrElse(index) { targets.last() }
@@ -195,8 +195,16 @@ class WorkbenchController(context: Context) {
         // 把**当前应该在前台的那个**重新置顶（不是固定第一个）。
         // 但用户手动浮出小窗时要放过：他一浮出，主窗再抢前台就会把小窗顶掉（"闪现一下又消失"）。
         if (current.manualOverlay != null) return
+        // 单应用（隐形小点）模式：窗口在系统眼里**仍然可见**时，一次都不许抢前台。
+        // 真机实测（m02023 / m02040）：这台 ROM 上 `am task focus` = 把这个任务整个顶到前台
+        // **并抢走输入焦点**；手势导航的返回是发给"当前有焦点的窗口"的 —— 原来每 2 秒来一条，
+        // 侧滑就永远落在那颗 2×2 小点上，用户正在用的 App 根本收不到返回（"侧滑返回桌面失效"）。
+        // 而保活不靠被 focus：窗口仍可见时进程一直是 TOP（真机实测连续 4 分钟以上不掉、不冻结），
+        // 所以这里只在"确实看不见"时才补一次兜底。多窗口平铺档位维持原样。
+        val singleDot = ordered.size == 1
         ordered.firstOrNull()?.let { main ->
             TaskInspector.find(main.packageName, main.userId)?.let { task ->
+                if (singleDot && task.visible) return@let
                 FreeformController.focusTask(task.taskId, main.component)
             }
         }
@@ -252,7 +260,7 @@ class WorkbenchController(context: Context) {
         val boundsList = if (scene.slots.size == 1) {
             listOf(dotBounds())
         } else {
-            LayoutEngine.layout(available, scene.preset, scene.slots.size)
+            LayoutEngine.layout(available, scene.preset, scene.slots.size, offscreenDot = dotBounds())
         }
         val log = ArrayList<String>()
         log += "可用区=$available ${screen.width}x${screen.height} 顶栏=${screen.topInset}" +
@@ -521,10 +529,24 @@ class WorkbenchController(context: Context) {
         update { it.copy(manualOverlay = null, message = "已收起浮窗") }
     }
 
-    /** 隐形保活小点：右下角 2×2 像素。 */
+    /**
+     * 隐形保活小点：**屏幕外**右下方向的 2×2 像素。
+     *
+     * 为什么放在屏幕外，而不是屏幕内右下角（m02040 结论）：
+     * 这台 ROM 会给可见的自由窗口画一圈系统装饰（记录里的"小角"）。窗口贴在屏幕内右下角时，
+     * 那圈装饰会露出屏幕一角，用户明确表示"大半在屏幕外也是坏掉的"。把窗口连装饰一起挪到
+     * **真实屏幕之外**，屏幕上就一点都看不见了；而系统的"可见"判定看窗口状态、不看坐标 ——
+     * 真机实测（含 9 分钟长测）：任务仍 `visible=true`、`visibleRequested=true`、窗口 `isOnScreen=true`、
+     * 进程 `curProcState=2`(TOP)、`isFrozen=false`，保活照旧。
+     *
+     * 注意用**真实屏幕**尺寸（不是挖掉 Dock / 系统栏的可用区）：小点在屏幕外，
+     * 与 Dock、状态栏、导航栏都不再有关系，也就不会再被"可用区"算进去。
+     */
     private fun dotBounds(): com.miniworld.model.Bounds {
-        val a = ScreenMetrics.read(appContext).availableBounds(rightInset = DockView.widthPx(appContext))
-        return com.miniworld.model.Bounds(a.right - 2, a.bottom - 2, a.right, a.bottom)
+        val s = ScreenMetrics.read(appContext)
+        val left = s.width + DOT_OUT_X
+        val top = s.height + DOT_OUT_Y
+        return com.miniworld.model.Bounds(left, top, left + 2, top + 2)
     }
 
     /**
@@ -639,5 +661,9 @@ class WorkbenchController(context: Context) {
 
         /** 非平铺档位下拿不到真实 bounds，用零矩形明确表示"未知"，不要假装知道。 */
         val UNSET_BOUNDS = com.miniworld.model.Bounds(0, 0, 0, 0)
+
+        /** 隐形小点相对**真实屏幕**右下角的外移量（像素）：整块落在屏幕外，屏幕上什么都看不见。 */
+        const val DOT_OUT_X = 16
+        const val DOT_OUT_Y = 34
     }
 }
