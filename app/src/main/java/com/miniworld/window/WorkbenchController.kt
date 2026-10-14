@@ -1,9 +1,16 @@
 package com.miniworld.window
 
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.miniworld.apps.AppCatalog
 import com.miniworld.data.SceneStore
 import com.miniworld.model.AppTarget
@@ -14,12 +21,15 @@ import com.miniworld.model.WorkbenchMode
 import com.miniworld.model.appTargets
 import com.miniworld.model.taskIdsOf
 import com.miniworld.service.DockView
+import com.miniworld.service.WorkbenchService
 import com.miniworld.system.Diag
 import com.miniworld.system.FreeformController
 import com.miniworld.system.KeepAlive
 import com.miniworld.system.ScreenMetrics
 import com.miniworld.system.TaskInspector
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 /**
  * 工作台编排器。
@@ -116,50 +126,242 @@ class WorkbenchController(context: Context) {
      * 只在"小点模式 + 竖屏"动手：浮出态不碰（那时它本来就该拿着焦点）；横屏/旋转期间不介入
      * （那条路会由系统重排 + forceReconcile 自己好）。
      */
-    private fun handBackStolenFocus(dump: String) {
-        if (state.manualOverlay != null) return
+    private fun handBackStolenFocus(dump: String): Boolean {
+        if (state.manualOverlay != null) return false
         if (appContext.resources.configuration.orientation ==
             android.content.res.Configuration.ORIENTATION_LANDSCAPE
         ) {
-            return
+            return false
         }
         val managed = (
             state.windows.map { it.packageName } +
                 (state.scene?.slots?.map { it.packageName } ?: emptyList())
             ).toSet()
-        if (managed.isEmpty()) return
+        if (managed.isEmpty()) return false
 
         val snap = TaskInspector.focusSnapshot(dump)
-        val focusedPkg = snap.focusedPackage ?: return
-        if (!managed.contains(focusedPkg)) return
-        val target = snap.resumedTaskId ?: return
-        if (target == snap.focusedTaskId) return
+        val focusedPkg = snap.focusedPackage ?: return false
+        if (!managed.contains(focusedPkg)) return false
+        val target = snap.resumedTaskId ?: return false
+        if (target == snap.focusedTaskId) return false
         val now = System.currentTimeMillis()
-        if (now - lastFocusHandBackAt < 3_000) return
+        if (now - lastFocusHandBackAt < 3_000) return false
         lastFocusHandBackAt = now
         Diag.log(TAG, "焦点被抢：$focusedPkg（任务 ${snap.focusedTaskId}）-> 交还给任务 $target")
         FreeformController.focusTask(target, null)
+        return true
     }
 
-    /** 看门狗跑了多少拍。只用来打低频心跳日志（S4 降噪后靠它确认"还活着"）。 */
-    private var tickCount = 0L
+    /** 屏幕是否亮着。熄屏时看门狗降频到 20 s（用户 m02893 选定的档位），亮屏保持 1.11 的 2 s。 */
+    @Volatile
+    private var screenOn = true
+
+    /** 刚动过窗口（resize / 焦点交还）之后，回到快档保持到这一刻；熄屏慢档下专门用来盯窗口落位。 */
+    @Volatile
+    private var fastUntil = 0L
+
+    /** 上一次心跳日志的时间戳。按**时间**算而不是按拍数，两种节拍下都是 5 分钟一条。 */
+    private var lastHeartbeatAt = 0L
+
+    @Volatile
+    private var screenReceiverRegistered = false
+
+    /** 上一次真正跳过拍的时刻：漏拍巡检拿它和现在比。 */
+    @Volatile
+    private var lastTickAt = 0L
+
+    /**
+     * 漏拍巡检线程。为什么需要：真机 2026-10-13 实测过一次 **13.5 分钟零拍** ——
+     * 进程没死、服务没重启、窗口也没被回收，但消息循环整段没跑（拉回前台后积压的消息一次性补跑）。
+     * 单线程 Handler 链一旦断掉，原本没有任何人会发现。巡检每 60 s 看一眼，
+     * 漏拍就补一拍 + 写一条日志，让"看门狗还活着吗"在 diag.log 里看得见、也能自己活过来。
+     */
+    @Volatile
+    private var watchdogGuard: ScheduledExecutorService? = null
+
+    /**
+     * 亮灭屏广播（`ACTION_SCREEN_ON/OFF` 只能**动态注册**，好在动态注册不需要任何权限）。
+     * 收到就切档并立刻重排下一拍 —— 熄屏后先补快一拍（系统此刻常正在搬窗口），然后再慢下来。
+     */
+    private val screenStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val on = intent?.action == Intent.ACTION_SCREEN_ON
+            if (on == screenOn) return
+            screenOn = on
+            val base = TickPolicy.intervalMs(on, 0L, 0L) / 1000
+            Diag.log(TAG, "屏幕${if (on) "亮" else "熄"}：看门狗节拍 -> ${base} s")
+            main.removeCallbacks(reconcileTick)
+            main.postDelayed(reconcileTick, TickPolicy.TICK_MS)
+        }
+    }
+
+    /** 开工后启动看门狗：注册亮灭屏广播（幂等）+ 排第一拍。 */
+    private fun startWatchdog() {
+        if (!screenReceiverRegistered) {
+            val pm = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            screenOn = pm?.isInteractive ?: true
+            ContextCompat.registerReceiver(
+                appContext,
+                screenStateReceiver,
+                IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                },
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+            screenReceiverRegistered = true
+        }
+        lastHeartbeatAt = System.currentTimeMillis()
+        lastTickAt = lastHeartbeatAt
+        startGuard()
+        scheduleAlarm()
+        main.removeCallbacks(reconcileTick)
+        main.postDelayed(reconcileTick, TickPolicy.START_DELAY_MS)
+        Diag.log(
+            TAG,
+            "看门狗开拍：首拍延迟=${TickPolicy.START_DELAY_MS / 1000} s，" +
+                "亮屏节拍=${TickPolicy.TICK_MS / 1000} s，熄屏节拍=${TickPolicy.TICK_MS_SCREEN_OFF / 1000} s，" +
+                "闹钟兜底=${TickPolicy.ALARM_INTERVAL_MS / 60_000} 分钟"
+        )
+    }
+
+    /** 启动漏拍巡检（幂等）。 */
+    private fun startGuard() {
+        if (watchdogGuard != null) return
+        val guard = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "watchdog-guard").apply { isDaemon = true }
+        }
+        watchdogGuard = guard
+        guard.scheduleWithFixedDelay(
+            { runCatching { checkWatchdog() } },
+            GUARD_PERIOD_MS,
+            GUARD_PERIOD_MS,
+            TimeUnit.MILLISECONDS
+        )
+    }
+
+    private fun checkWatchdog() {
+        if (!state.running) return
+        val now = System.currentTimeMillis()
+        val interval = TickPolicy.intervalMs(screenOn, fastUntil, now)
+        if (!TickPolicy.isStalled(now, lastTickAt, interval)) return
+        Diag.log(
+            TAG,
+            "看门狗漏拍 ${(now - lastTickAt) / 1000} 秒（节拍=${interval / 1000} s），补一拍"
+        )
+        main.removeCallbacks(reconcileTick)
+        main.post(reconcileTick)
+    }
+
+    /** 收工 / 关闭：停拍并摘掉广播，别留着。`reason` 会写进日志，方便事后分清"谁让它停的"。 */
+    private fun stopWatchdog(reason: String) {
+        stopGuard()
+        cancelAlarm()
+        main.removeCallbacks(reconcileTick)
+        lastTickAt = System.currentTimeMillis()
+        if (screenReceiverRegistered) {
+            runCatching { appContext.unregisterReceiver(screenStateReceiver) }
+            screenReceiverRegistered = false
+        }
+        Diag.log(TAG, "看门狗停拍：$reason")
+    }
+
+    private fun stopGuard() {
+        watchdogGuard?.let { runCatching { it.shutdownNow() } }
+        watchdogGuard = null
+    }
+
+    /** 闹钟兜底的 PendingIntent（取消时要用同一份实例）。 */
+    private var alarmPending: PendingIntent? = null
+
+    /**
+     * 排一个"还活着吗"的系统闹钟。
+     *
+     * 为什么需要它：真机 2026-10-13 复现过**整进程被 ROM 挂起 13.5 分钟** —— 那种情况下
+     * 进程内的巡检线程（watchdogGuard）一起被冻住，谁也救不了自己。系统为投递闹钟会主动
+     * 唤醒进程，`setAndAllowWhileIdle` 又不需要任何新权限，这是唯一还能从进程外把我们叫醒的
+     * 通道。代价只有每 10 分钟一次唤醒（比亮屏 2 s 一拍便宜两个数量级）。
+     */
+    private fun scheduleAlarm() {
+        val am = appContext.getSystemService(AlarmManager::class.java) ?: return
+        val pi = PendingIntent.getService(
+            appContext,
+            0,
+            Intent(appContext, WorkbenchService::class.java).setAction(WorkbenchService.ACTION_PING),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        alarmPending = pi
+        runCatching {
+            am.setAndAllowWhileIdle(
+                AlarmManager.RTC_WAKEUP,
+                System.currentTimeMillis() + TickPolicy.ALARM_INTERVAL_MS,
+                pi
+            )
+        }
+    }
+
+    private fun cancelAlarm() {
+        val pi = alarmPending ?: return
+        runCatching { appContext.getSystemService(AlarmManager::class.java)?.cancel(pi) }
+        alarmPending = null
+    }
+
+    /**
+     * 闹钟到点（由 `WorkbenchService` 的 ACTION_PING 调进来）：报一句"距上一拍多久"，
+     * 确认漏拍就补一拍，然后把下一个闹钟排上。
+     *
+     * 正常情况下这条日志每 10 分钟一条 —— 它和 5 分钟一条的心跳是**两条独立的证据链**
+     * （心跳走消息循环，闹钟走系统 AlarmManager）：两条一起哑掉，才是真的被冻住了。
+     *
+     * @return 工作台是否仍在运行；false 时服务会顺手收掉自己。
+     */
+    fun pingFromAlarm(): Boolean {
+        if (!state.running) {
+            Diag.log(TAG, "闹钟兜底：工作台已不在运行，忽略")
+            return false
+        }
+        val now = System.currentTimeMillis()
+        val interval = TickPolicy.intervalMs(screenOn, fastUntil, now)
+        Diag.log(TAG, "闹钟兜底：距上一拍 ${(now - lastTickAt) / 1000} s（节拍=${interval / 1000} s）")
+        if (TickPolicy.isStalled(now, lastTickAt, interval)) {
+            Diag.log(TAG, "闹钟兜底：确实漏拍，补一拍")
+            main.removeCallbacks(reconcileTick)
+            main.post(reconcileTick)
+        }
+        scheduleAlarm()
+        return true
+    }
 
     private val reconcileTick = object : Runnable {
         override fun run() {
-            if (!state.running) return
-            submit("校正窗口") { reconcileBounds() }
-            // S4：日志降噪后不再逐条命令写盘，改成 5 分钟一条心跳（不查也 ping，零命令开销）。
-            tickCount++
-            if (tickCount % HEARTBEAT_TICKS == 0L) {
-                val s = state
-                Diag.log(
-                    TAG,
-                    "看门狗心跳：第 $tickCount 拍（约 ${tickCount * 2 / 60} 分钟），" +
-                        "窗口=${s.windows.joinToString { "${it.packageName}@${it.userId}" }}，" +
-                        "模式=${s.mode}，浮窗=${s.manualOverlay ?: "无"}"
-                )
+            lastTickAt = System.currentTimeMillis()
+            if (!state.running) {
+                // 这里以前是"直接 return、不再排下一拍"：只要 running 判错一次（或有人漏了停拍日志），
+                // 节拍链就永久断掉且没人知道。现在停就写明白原因，续拍一律走 finally。
+                Diag.log(TAG, "看门狗停跳：工作台已不在运行")
+                return
             }
-            main.postDelayed(this, 2_000)
+            try {
+                submit("校正窗口") { reconcileBounds() }
+                // S4：日志降噪后不再逐条命令写盘，改成 5 分钟一条心跳（不查也 ping，零命令开销）。
+                // 按**时间**判断：熄屏 20 s 一拍时，"150 拍"会变成 50 分钟一条。
+                val now = System.currentTimeMillis()
+                if (now - lastHeartbeatAt >= TickPolicy.HEARTBEAT_MS) {
+                    lastHeartbeatAt = now
+                    val s = state
+                    Diag.log(
+                        TAG,
+                        "看门狗心跳：窗口=${s.windows.joinToString { "${it.packageName}@${it.userId}" }}，" +
+                            "模式=${s.mode}，浮窗=${s.manualOverlay ?: "无"}，" +
+                            "节拍=${TickPolicy.intervalMs(screenOn, fastUntil, now) / 1000} s"
+                    )
+                }
+            } catch (t: Throwable) {
+                // 单拍的意外（比如 worker 已 shutdown 的 RejectedExecutionException）不许杀死整条节拍链。
+                Diag.log(TAG, "看门狗这一拍出错（照常续拍）：${t.javaClass.simpleName}: ${t.message}")
+            } finally {
+                main.postDelayed(this, TickPolicy.intervalMs(screenOn, fastUntil, System.currentTimeMillis()))
+            }
         }
     }
 
@@ -193,6 +395,7 @@ class WorkbenchController(context: Context) {
         } else {
             LayoutEngine.layout(available, current.preset, ordered.size, offscreenDot = dotBounds())
         }
+        var moved = false
         ordered.forEachIndexed { index, window ->
             val target = targets.getOrElse(index) { targets.last() }
             // 用户手动浮出的那个小窗不要动，否则 6 秒后就被看门狗掰回小点
@@ -207,11 +410,18 @@ class WorkbenchController(context: Context) {
                 Thread.sleep(200)
                 FreeformController.resizeTask(task.taskId, target)
                 Diag.log(TAG, "校正：${window.packageName} ${task.bounds} -> $target")
+                moved = true
             }
         }
 
         // 焦点被别的全屏任务抢走 → 还给用户真正在看的那个任务：只发一条 am task focus，几何不动。
-        handBackStolenFocus(dump)
+        val handedBack = handBackStolenFocus(dump)
+
+        // 这一拍真的动过东西（校正过窗口 / 交还过焦点）→ 接下来 10 s 保持快档盯着它落位。
+        // 熄屏慢档下这一步很关键：一次 resize 要"先小后大"两步才生效，不能发完就睡 20 s。
+        if (moved || handedBack) {
+            fastUntil = System.currentTimeMillis() + TickPolicy.FAST_HOLD_MS
+        }
 
         // 把**当前应该在前台的那个**重新置顶（不是固定第一个）。
         // 但用户手动浮出小窗时要放过：他一浮出，主窗再抢前台就会把小窗顶掉（"闪现一下又消失"）。
@@ -438,9 +648,8 @@ class WorkbenchController(context: Context) {
         // 保活是必需的，不提供开关：开工即把每个挂机应用加进白名单/活跃桶。
         applyKeepAlive(appTargets(windows, scene.slots), enable = true)
 
-        // 开工后启动窗口看门狗（每 6 秒把跑偏的自由窗口拉回格子）
-        main.removeCallbacks(reconcileTick)
-        main.postDelayed(reconcileTick, 6_000)
+        // 开工后启动窗口看门狗（把跑偏的自由窗口拉回格子；节拍见 TickPolicy）
+        startWatchdog()
     }
 
     // ------------------------------------------------------------------ 切换
@@ -625,7 +834,7 @@ class WorkbenchController(context: Context) {
      */
     fun stop(killApps: Boolean = false, onFinished: (() -> Unit)? = null) = submit("收工") {
         try {
-            main.removeCallbacks(reconcileTick)
+            stopWatchdog("收工")
             val current = state
             val log = ArrayList<String>()
             // 「关闭 / 撤销保活」一律以「包名 + 用户号」为单位：同名包在主机和手机分身上各有一份，
@@ -671,7 +880,7 @@ class WorkbenchController(context: Context) {
     }
 
     fun shutdown() {
-        main.removeCallbacks(reconcileTick)
+        stopWatchdog("服务销毁")
         // 温和关闭：让已经在跑的收工动作把话说完。`shutdownNow()` 会打断工作线程，
         // 真机事故：收工里的 dumpsys 被打断成 InterruptedException，后台卡片摘不掉。
         runCatching { worker.shutdown() }
@@ -687,7 +896,8 @@ class WorkbenchController(context: Context) {
         const val DOT_OUT_X = 16
         const val DOT_OUT_Y = 34
 
-        /** 看门狗心跳日志的间隔（拍）：150 拍 × 2 秒 = 5 分钟一条。 */
-        const val HEARTBEAT_TICKS = 150L
+        /** 漏拍巡检间隔：60 s 看一眼，比任何一档节拍都粗，本身几乎不耗电。 */
+        const val GUARD_PERIOD_MS = 60_000L
+
     }
 }

@@ -38,6 +38,9 @@ class WorkbenchService : Service(), DockView.Listener {
     companion object {
         const val ACTION_START_SCENE = "com.miniworld.START_SCENE"
         const val ACTION_STOP = "com.miniworld.STOP"
+
+        /** 闹钟兜底专用：系统闹钟到点后由 AlarmManager 投递进来（见 WorkbenchController.pingFromAlarm）。 */
+        const val ACTION_PING = "com.miniworld.WATCHDOG_PING"
         const val EXTRA_SCENE_ID = "scene_id"
         const val EXTRA_KILL = "kill"
 
@@ -126,6 +129,13 @@ class WorkbenchService : Service(), DockView.Listener {
                 // 收工第一条 dumpsys 直接 InterruptedException，后台卡片摘不掉（真机事故 2026-10-13）。
                 teardownDock()
                 controller.stop(intent.getBooleanExtra(EXTRA_KILL, false)) { stopSelf() }
+            }
+
+            ACTION_PING -> {
+                // 系统闹钟把我们从"整进程被冻住"里叫醒：先报一句"距上一拍多久"，真漏拍就补一拍，
+                // 并把下一个闹钟排上。工作台已经不在运行时控制器返回 false，服务顺手收掉自己，
+                // 免得留一个常驻通知。
+                if (!controller.pingFromAlarm()) stopSelf()
             }
 
             else -> Log.i(TAG, "未知指令：${intent.action}")
