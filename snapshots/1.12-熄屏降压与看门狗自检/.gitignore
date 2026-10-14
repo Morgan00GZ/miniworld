@@ -1,0 +1,60 @@
+# ---------- Android / Gradle ----------
+*.apk
+*.aar
+*.aab
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/
+.gradle/
+build/
+local.properties
+proguard/
+captures/
+.externalNativeBuild/
+.cxx/
+*.jks
+*.keystore
+google-services.json
+lint/intermediates/
+lint/generated/
+lint/outputs/
+lint/tmp/
+lint/reports/
+*.hprof
+
+# ---------- IDE ----------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.navigation/
+vcs.xml
+
+# ---------- 日志 / 临时 ----------
+*.log
+*.tmp
+*.bak
+tools/probe-output/
+tools/*-log.txt
+.DS_Store
+Thumbs.db
+
+# ---------- Node / DSH 工具链 ----------
+node_modules/
+.npm/
+.pnpm-store/
+.dsh-cache/
+*.tsbuildinfo
+
+# ---------- 本地私密配置 ----------
+*.local
+.env
+.env.*
+
+# ---------- 版本快照（A 方案：每赋予版本号都留快照，tag 指向它）----------
+# 上面的 *.apk 是给构建产物用的；快照里的 APK 是"这一版能原样装起来"的凭证，必须进仓库。
+!snapshots/**/*.apk
