@@ -1,266 +1,294 @@
 # 须弥芥子 · miniworld
 
-面向 **小米澎湃 OS（HyperOS）** 的「锤子一步 / OriginOS 原子工作台」式多应用同屏工作台。
-通过 **Shizuku** 借用 shell 身份驱动系统 **自由窗口（Freeform）**，把多个 App 铺成可编排的栅格，
-**一键切换主位、一键收工**，面向「多个游戏同时挂机 + 看视频」的场景。
+**把一个 Android 应用藏到屏幕外继续跑，随时一键唤出成浮窗，用完再收回。**
 
-> **它不是"变出更多内存和 GPU"**，而是把系统本来就有、但被藏在多任务手势里的 Freeform 能力，
-> 变成一块可编程的工作台。核心机制是 Android 10+ 的 **multi-resume**：
-> 只要窗口在屏幕上可见，它的 Activity 就处于 `RESUMED` 而不是 `PAUSED`，游戏继续跑、视频继续播。
+<sub>Android 11+（minSdk 30）· 实测机型 Xiaomi HyperOS 4 / Android 17（1220×2656）· 依赖 [Shizuku](https://shizuku.rikka.app/) · 无需 root · 未声明任何联网权限</sub>
+
+> *Hide an Android app off-screen so it keeps running in the background, then pop it back as a floating window with one tap.*
+
+> 自用工具，仅供学习与个人使用。它不是游戏外挂：**不注入、不修改目标应用、不 hook 系统**，只使用系统公开的窗口 / 任务 / shell 命令。挂机行为可能违反某些游戏的用户协议，风险请自行判断。
 
 ---
 
-## 一、这份仓库里有什么
+## 1. 它解决什么问题
 
-```
-miniworld/
-├─ README.md                      本文件：总览、构建、快速开始
-├─ docs/
-│  ├─ 01-可行性分析.md            能力边界、系统机制、必须真机验证的项
-│  ├─ 02-架构与命令映射.md        模块划分 + 每条 shell 命令的用途与回退
-│  ├─ 03-真机验证清单.md          按顺序打勾的验收步骤
-│  ├─ 04-同类项目对照与规划修订.md 8 个同类项目的机制对照 + 假设修正过程
-│  └─ 05-需求收敛与架构定稿.md    定稿：主屏 + 虚拟屏副槽 + 任务交换，M1–M5
-├─ tools/
-│  ├─ probe-hyperos.ps1           PC 端（Windows + adb）能力探测，装 App 之前先跑它
-│  ├─ probe-hyperos.sh            同一套探测项，手机 Termux（走 Shizuku rish）或 PC Bash 都能跑
-│  ├─ verify-layout.py            布局引擎交叉校验（不需要 JDK/SDK）
-│  ├─ verify-probe-sh.py          probe-hyperos.sh 的静态检查 + 解析逻辑等价验证
-│  ├─ build-apk.bat               ★双击这个：一键装工具链并编译出 APK
-│  └─ setup-build-env.ps1         上面那个 .bat 真正调用的脚本（也可带参数单独跑）
-├─ app/src/main/java/com/onestep/workbench/
-│  ├─ shizuku/                    授权与 shell 执行
-│  ├─ system/                     能力探测、自由窗口控制、任务查询、挂机保活
-│  ├─ window/                     纯函数布局引擎（可单测）+ 窗口编排
-│  ├─ service/                    前台服务 + 一步式悬浮 Dock
-│  ├─ data/ model/ apps/          场景存储、数据模型、应用枚举
-│  └─ ui/                         授权页 / 自检页 / 场景编辑页
-└─ app/src/test/                  布局引擎单元测试（纯 JVM，无需真机）
-```
+手游挂机（或任何需要长时间在线的应用）有两个麻烦：
 
-## 二、目标形态与架构定稿
+1. 它得一直占着屏幕，人就没办法用手机；
+2. 一退到后台，就可能被系统省电策略**冻结或杀掉**，掉线。
 
-> 需求已收敛为：**不做分身/多开**（OS 已有），只要「多个 App 同时运行 + 保活 + 一键切到前台」。
-> 定稿见 [docs/05-需求收敛与架构定稿.md](docs/05-需求收敛与架构定稿.md)，项目对照见 [docs/04](docs/04-同类项目对照与规划修订.md)。
+须弥芥子的做法是借用 Android 的**自由窗口（freeform）**：把目标应用用自由窗口拉起来，再把它缩成 **2×2 像素**、整块挪到**真实屏幕之外**。
 
-**一个必须先接受的事实**：Android 的"运行"分两层——**进程层保活**（不被冻结，shell 命令就能做）
-与 **Activity 层保活**（不被暂停、继续渲染）。一个全屏 App 会盖住其它窗口，被盖住的窗口就不可见、就被 `PAUSE`。
-所以「一个全屏 + 其它继续跑」在普通窗口模型下**不存在**，只有三条通路：
+- 屏幕上一点都看不见（连系统给自由窗口画的那圈装饰也一起在屏幕外）；
+- 但系统判定窗口「可见」→ 进程保持 TOP、不被冻结，画面继续渲染。
+  （Android 的可见性看窗口状态，不看坐标——这是整个方案成立的前提。）
 
-| 通路 | 能否满足"多个 + 不占屏 + 继续跑" |
-| --- | --- |
-| **虚拟屏 VirtualDisplay** | ✅ 唯一同时满足三者：App 在另一块"显示设备"上，系统认为它可见 |
-| 小窗 / 分屏 | ❌ 必须占屏，就做不到"全屏看一个" |
-| 画中画 PiP | ❌ 系统全局只允许 1 个 PiP |
+桌面常驻一条 48dp 宽的半透明悬浮图标条（Dock）：
 
-**定稿架构 = 主屏保持真实主屏（当前选中的 App 原生全屏）+ 副槽用 1~3 个虚拟屏承载后台 App +
-一键切前台 = 任务在两者之间交换。** 参考实现是 Apache-2.0 的 [NeXtep](https://github.com/lujinxin/NeXtep)
-（"三个实时小窗由 lifecycle-bound virtual display 支撑，点击即与主窗口交换任务"）。
+- 点应用图标 → 目标应用从屏幕外**弹成浮窗**（约可用宽的 3/4、16:9），可以直接看和操作；
+- 再点一下 → 收回屏幕外的小点；
+- 「关闭」→ 结束该应用，并把它在「最近任务」里的卡片**一起摘掉**。
 
-> **⚠️ 真机探测已完成（2026-10，Xiaomi 25098PN5AC / Android 17 / HyperOS 4.0）**：
-> 修复探测脚本的三处 bug 后重跑，**PASS=19 WARN=4 FAIL=0**，
-> **结论 = 档位 A（系统自由窗口真同屏平铺）实测可用**——`am start --windowingMode 5` 起得来
-> （`taskId=91`、`mode=freeform`）、`am task resize` 改得动（`mBounds=Rect(0,0-540,1200)`）、
-> `am task focus` 前置得了（`Setting focus to task 91`）。
-> **下一步 = 编译 APK 装到手机，试 `MAIN_3MINI` 预设**（docs/03 阶段 1–3）。
-> 上面那张"虚拟屏是唯一通路"的表说的是**"不占屏"这一列**；而"多个 App 同时跑"用 A 档同屏平铺已经成立。
-> 逐条实测证据见 [docs/03 阶段 0.7](docs/03-真机验证清单.md)，踩坑记录见 [docs/01 第 7 节](docs/01-可行性分析.md)。
+## 2. 功能
 
-| 档位 | 机制 | 用途 | 状态 |
-| --- | --- | --- | --- |
-| **A · 系统自由窗口平铺** | `--windowingMode 5`（Freeform）+ `am task resize`（4 个分开的数字）+ `am task focus` | 多个 App 真同屏、都可见、都继续跑 | **已实测通过，当前主方案** |
-| **D · 虚拟屏后台槽** | **App 自建** `VirtualDisplay`；切换 = 跨屏搬任务 | 多个 App 同时跑 + **不占屏** | 可选增强；前置 = **M2-2 自建 VirtualDisplay** |
-| **A+ · 小米原生小窗服务** | binder 调 `mi_freeform.startAppInFreeform` | 官方小窗手感、尺寸/DPI 精确 | **本机无该服务，作废**（P9 实测） |
-| **B · 厂商小窗** | HyperOS 自带小窗 / 迷你小窗 | 单挂机位兜底 | 系统自带 |
-| **C · 保活 + 前置切换** | deviceidle / appops / standby-bucket | 进程层保活，切回即续上 | 代码已就绪（P7 实测 PASS） |
+| 位置 | 行为 |
+|---|---|
+| 首页 | 「启动 / 关闭 / 更换」三个按钮；状态（运行中 / 未运行）；三行权限体检（Shizuku / 悬浮窗 / 通知），点哪行跳哪行系统设置 |
+| Dock | 目标应用图标（点一下浮出、再点收回）、「主页」按钮、长按 = 保活复查 |
+| 后台看门狗 | 亮屏每 2 s、熄屏每 20 s 校正窗口位置；转屏后自动重排；焦点被别的全屏任务抢走时把它还给用户真正在看的任务；漏拍自检 + 10 分钟闹钟兜底 |
+| 保活 | 一键下发 5 条 shell 保活命令（见 §5.3），「关闭」时逐条撤销 |
+| 场景 | 记录目标应用与启动组件；**支持小米手机分身（XSpace，userId 999）**里的那一份——同包名靠用户号区分 |
 
+**明确不做**：应用多开、虚拟屏、游戏加速器、多窗口平铺。整个应用只有一个界面。
 
-App 启动时会跑**能力自检**（`system/SystemProbe.kt`），自动落到能用的最高档位；
-每一档都保留手工覆盖开关，因为这类能力**必须真机验证**，不能纸上假设。
+## 3. 依赖了手机 OS 的哪些能力
 
-> 当前代码实现的是 **A 档 + C 档保活**。**D 档（虚拟屏）是 M2-2，属于可选增强**：
-> A 档已经能同时满足"多个 App 持续运行"，D 档省掉的是"占屏"这一点。
-> 但 D 档**不能再用 `overlay_display_devices` 走捷径**——实测建屏成功（新增 `displayId=7`）
-> 却无法往它启动 App（`SecurityException at SafeActivityOptions.checkPermissions`），
-> 必须由 App 自建 VirtualDisplay。
+| 能力 | 实际用的东西 | 为什么必须有 |
+|---|---|---|
+| 自由窗口 | `am start --windowingMode 5`、`am task resize <id> l t r b` | 唯一能在本机跑通的「小窗保活」路径（本机 `am start --bounds` 不支持） |
+| 任务 / 窗口状态 | 解析 `dumpsys activity activities` 的 `* Task{...}` 行 | 取窗口矩形、`visible`、`visibleRequested`、`mode=freeform`、`U=0/999`；判断窗口是否被系统搬走 |
+| shell 执行通道 | **Shizuku**：`Shizuku.newProcess("sh","-c",cmd)`（uid 2000） | 上面这些 `am` / `cmd` / `dumpsys` 都要 shell 权限；Shizuku 提供「一次授权、无需 root」的通道 |
+| 悬浮 Dock | `SYSTEM_ALERT_WINDOW` + 前台服务（`specialUse`） | 常驻一条可点的悬浮图标条；同时让编排服务不被回收 |
+| 屏幕开关 | `ACTION_SCREEN_ON` / `ACTION_SCREEN_OFF` + `PowerManager.isInteractive`（**动态注册，不需要权限**） | 熄屏降频、亮屏恢复 2 s 节拍 |
+| 兜底唤醒 | `AlarmManager.setAndAllowWhileIdle`（**不需要权限**） | ROM 把整个进程挂起时，唯一还能从进程外把自己叫醒的通道 |
+| 开机自启 | `BOOT_COMPLETED` / `MY_PACKAGE_REPLACED` | 重启后恢复 Dock（挂机场景仍需手动「启动」） |
 
-> **v2 修订**：按需求去掉了实时小窗预览——后台 App 只要求"活着"，不要求"看得见"。
-> 这一刀砍掉了画面镜像、触摸注入、输入法转发、缩略图这四条最容易碎的链路；Dock 只留应用图标。
-> 但代价要说清：**虚拟屏上的 App 仍然要渲染**，而且必须有个消费者把帧读走再丢掉，
-> 否则缓冲区满了它会卡在 `eglSwapBuffers`（比被暂停更糟）。真正的省性能手段是
-> **低分辨率虚拟屏 + 屏数量上限 + 池化复用**。
+**不依赖**：root、无障碍服务、Xposed/LSPosed、虚拟屏、任何系统 hook。
 
-### M2-2 的 go/no-go：必须自建虚拟屏，**overlay 捷径已被实测否掉**
+## 4. 需要赋予的权限
 
-```powershell
-.\tools\probe-hyperos.ps1 -VirtualDisplayTest
-```
+| 权限 | 类型 | 为什么需要 |
+|---|---|---|
+| `moe.shizuku.manager.permission.API_V23` | Shizuku | 以 shell(uid=2000) 执行 `am` / `cmd` / `dumpsys` |
+| `SYSTEM_ALERT_WINDOW` | 特殊（需手动开） | 画常驻悬浮 Dock。**硬门槛**：没它就是一块什么都点不动的界面 |
+| `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_SPECIAL_USE` | 普通 | 承载 Dock 与窗口编排的前台服务（`PROPERTY_SPECIAL_USE_FGS_SUBTYPE` = 「保持多窗口工作台的悬浮 Dock 与窗口编排常驻」） |
+| `POST_NOTIFICATIONS` | 运行时（13+） | 前台服务通知可见，用户能确认「正在挂机」 |
+| `QUERY_ALL_PACKAGES` | 普通（敏感） | 「更换」里列出可挂机的应用；只在本地读包名与图标 |
+| `RECEIVE_BOOT_COMPLETED` | 普通 | 开机后恢复 Dock |
+| `VIBRATE` | 普通 | Dock 长按触感反馈 |
 
-它用系统的 `overlay_display_devices` 造一块虚拟屏 → 试图把目标 App 放上去 → **自动清理设置**。
+> **没有 `INTERNET` 权限**：应用不联网、不上传任何数据。
 
-**实测结论（2026-10）**：建屏成功（新增 `displayId=7`），但 `am start --display 7` 被
-`SecurityException at SafeActivityOptions.checkPermissions` 拒绝——
-**系统持有的屏不接受 shell 的启动请求**。所以这条捷径对 D 档无效（详见
-[docs/05 第 5 节](docs/05-需求收敛与架构定稿.md)），必须做 M2-2「App 自建 VirtualDisplay」。
-**这不影响 A 档**：A 档不依赖虚拟屏。
+## 5. 针对本机调过的参数与对应代码
 
-### 当前状态 / 下一步
+下列参数都是在一台 **Xiaomi HyperOS 4 / Android 17、1220×2656、375dp 宽** 的真机上试出来的；换机型时大概率要重调（见 §7）。
 
-| 项 | 状态 |
-| --- | --- |
-| 真机能力探测（PC 端，`tools/probe-hyperos.ps1`） | **已完成**（三处脚本 bug 已修，`PASS=19 WARN=4 FAIL=0`） |
-| 结论 | **档位 A 可用**：自由窗口起得来、尺寸改得动、任务前置得了 |
-| 下一步 | **双击 `tools\build-apk.bat` 编译 APK → `adb install` → 试 `MAIN_3MINI` 预设**（见第三节"构建"与第四节"快速开始"） |
-| 仍待验证 | P5 多窗口共存（`-SecondPackage` 重跑）、P6 失焦继续运行（人眼）、P18.4 锁屏存活 |
-| 可选增强 | D 档（虚拟屏后台槽）→ 先做 M2-2 自建 VirtualDisplay PoC |
+### 5.1 参数表
 
+| 参数 | 当前值 | 位置 | 为什么是这个值 |
+|---|---|---|---|
+| 隐形小点位置 | 真实屏幕右下再外移 `+16 / +34` px | `app/.../window/WorkbenchController.kt:775`（`DOT_OUT_X/Y` 在 `:896-897`） | 让**小点 + 系统给自由窗口画的装饰**一起落到屏幕外；留 16/34 px 余量，装饰才不外露 |
+| 小点尺寸 | 2×2 px | 同上 | 只要窗口「可见」即可保活，占用越小越好 |
+| 看门狗节拍 | 亮屏 2 s / 熄屏 20 s | `app/.../window/TickPolicy.kt:16,19` | 每拍要起一个 `sh` 跑一条 `dumpsys`（实测 ~0.01 s、72 KB）；熄屏时用户不看屏幕，降到 20 s；熄屏兜底最长也就晚 20 s |
+| 动过窗口后的快档保持 | 10 s | `TickPolicy.kt:26` | `resize` 在本机要「先小后大」两步才落位，确认必须跟得上 |
+| 开工首拍延迟 | 6 s | `TickPolicy.kt:29` | 给系统把窗口拉起来的时间 |
+| 心跳日志间隔 | 5 min（按时间算，不按拍数） | `TickPolicy.kt:32` | 两种节拍下都是 5 分钟一条，日志好读 |
+| 漏拍判据 | `两拍 + 5 s` | `TickPolicy.kt:58` | 真机复现过**整进程被挂起 13.5 分钟**，需要一条能自证的判据 |
+| 闹钟兜底 | 10 min | `TickPolicy.kt:41` | 进程内巡检线程会跟进程一起被冻住，只能靠系统闹钟从外部唤醒 |
+| 两步摆位 | 缩到 3/5 → 200 ms（校正）/ 350 ms（浮出）→ 目标 | `WorkbenchController.kt:409-410,710-711` | 单次 `resize` 在转屏后经常不生效 |
+| 浮窗尺寸 | 可用宽的 3/4，16:9，居中 | `WorkbenchController.kt:788`（`overlayBounds`） | 横屏游戏是 16:9，窗口同比例画面才铺满、触控映射才对 |
+| Dock 宽度 / 图标 | 48dp / 40dp，空闲 4 s 淡化到 `alpha=0.35`，200 ms 动画 | `app/.../service/DockView.kt:52-61,263` | 这台机器只有 375dp 宽，早先 70dp 的 Dock 会吃掉右边 1/5 |
+| 系统栏内缩兜底 | 状态栏 26dp / 导航栏 16dp | `app/.../system/ScreenMetrics.kt:61-62` | 服务在后台取不到窗口上下文，只能用系统资源 + 兜底值 |
 
+### 5.2 关键代码段
 
-## 三、构建
+**节拍策略**（`window/TickPolicy.kt`，纯函数、可单测）：
 
-### 3.1 一键脚本（本机没有 Java / Android SDK 时用这个）
+```kotlin
+const val TICK_MS = 2_000L            // 亮屏
+const val TICK_MS_SCREEN_OFF = 20_000L // 熄屏
+const val FAST_HOLD_MS = 10_000L       // 刚动过窗口 → 保持快档
+const val ALARM_INTERVAL_MS = 10 * 60 * 1000L
 
-这台机器原本**没有任何构建工具链**（没有 JDK、没有 Android SDK、没有 Gradle），所以准备了
-`tools/setup-build-env.ps1`。它会自动把 JDK 17 + Android 命令行 SDK + Gradle 8.9 装进一个
-普通文件夹（默认 `D:\DeepSeek Harness\AndroidDev`，不写系统目录、不需要管理员权限、不改 PATH），
-然后直接编译出 APK 并跑一遍单元测试。
+fun intervalMs(screenOn: Boolean, fastUntil: Long, now: Long): Long =
+    if (!screenOn && now >= fastUntil) TICK_MS_SCREEN_OFF else TICK_MS
 
-**双击 `tools\build-apk.bat` 即可。** 等价的命令行形式：
-
-```powershell
-cd miniworld
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-build-env.ps1
+fun stallThresholdMs(intervalMs: Long): Long = intervalMs * 2 + 5_000L
+fun isStalled(now: Long, lastTickAt: Long, intervalMs: Long): Boolean =
+    now - lastTickAt > stallThresholdMs(intervalMs)
 ```
 
-首次约需下载 500MB（JDK 190MB + SDK 平台与编译工具 200MB + Gradle 130MB），
-加编译依赖共 5~20 分钟。**之后改完代码重新编译不需要再下载**：
+**屏幕外小点**（`window/WorkbenchController.kt:775`）：
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\setup-build-env.ps1 -SkipDownload
+```kotlin
+private fun dotBounds(): Bounds {
+    val s = ScreenMetrics.read(appContext)          // 真实屏幕，不是挖掉系统栏的可用区
+    val left = s.width + DOT_OUT_X                  // DOT_OUT_X = 16
+    val top = s.height + DOT_OUT_Y                  // DOT_OUT_Y = 34
+    return Bounds(left, top, left + 2, top + 2)     // 2×2，整块在屏幕外
+}
 ```
 
-| 产物 / 日志 | 位置 |
-| --- | --- |
-| APK | `app\build\outputs\apk\debug\app-debug.apk` |
-| 全过程日志（**任何一步出错都在这里**，失败时发这个） | `tools\build-log.txt` |
-| gradle 原始输出 | `tools\gradle-log.txt` |
-| SDK 安装器原始输出 | `tools\sdkmanager-log.txt` |
-| 单元测试日志 | `tools\test-log.txt` |
+**保活命令**（`system/KeepAlive.kt:31-48`，全部按用户号下发，可逐条撤销）：
 
-其他参数：`-Install` 编译完直接 `adb install`；`-Clean` 先 clean；`-Root D:\其他路径` 换安装位置。
-想彻底卸载工具链：删掉 `D:\DeepSeek Harness\AndroidDev` 整个文件夹。
-
-> 脚本内置的几处 Windows 适配，全部是真机上踩出来的：
-> ① 显式打开 TLS 1.2（Windows PowerShell 5.1 默认只开 TLS 1.0，直连 `dl.google.com` 会报
-> "基础连接已经关闭: 接收时发生错误"，看着像断网其实不是）；② 下载失败后改用系统自带 `curl.exe` 重试；
-> ③ `build-log.txt` 用 `Start-Transcript` **从第一行就开始记**（旧版只在编译那一步才建日志，
-> 前面步骤一挂，磁盘上连日志文件都没有，只能靠回想）；④ 装 SDK 时**不调 `sdkmanager.bat`，
-> 而是用 `java.exe` 直接跑同一个类**——PowerShell 把带 `;` `=` 的参数交给 `.bat` 时会经 `cmd.exe`
-> 重新切分，实测三个参数会被粘成一个
-> `--sdk_root=D:\DeepSeek Harness\AndroidDev\sdk platforms;android-35 build-tools;35.0.0`，sdkmanager 拿整串当 sdk_root，
-> 建出一个怪名字的空目录、一个包都没装，**退出码还是 0**，非常难查；
-> ⑤ `.ps1` 必须保持 UTF-8 **BOM**（无 BOM 时 5.1 按 GBK 解析中文，报一堆假语法错误），
-> `build-apk.bat` 每次启动都会检查并自动补回 BOM；
-> ⑥ 安装器的输出必须**实时显示**：旧版把输出收进变量、装完才一起打印，结果安装器问
-> `Accept? (y/N)` 时屏幕上一片空白，它等你按回车、你等它出结果，双双卡死十分钟；现在输出实时上屏，
-> 并且脚本把 `y` 自动喂给安装器（原始记录留在 `sdkmanager-log.txt`）。
-
-### 3.2 手动构建（本机已有 Android Studio / JDK 时）
-
-要求：JDK 17、Android SDK（`platforms;android-35`、`build-tools;35.0.0`）、Android Studio Ladybug 或更新。
-
-```powershell
-cd miniworld
-
-# 1) SDK 路径（注意键名是小写的 sdk.dir）
-"sdk.dir=D:\\Android\\Sdk" | Out-File -Encoding ascii local.properties
-
-# 2) 生成 gradle wrapper（仓库里不提交二进制 wrapper jar）
-gradle wrapper --gradle-version 8.9
-
-# 3) 编译
-.\gradlew.bat :app:assembleDebug
-# 产物：app\build\outputs\apk\debug\app-debug.apk
-
-# 4) 不需要真机就能跑的校验：布局引擎的不变量测试
-.\gradlew.bat :app:testDebugUnitTest
+```kotlin
+"cmd deviceidle whitelist +$pkg"                                            // 电池优化白名单（全机，无 --user）
+"am set-inactive --user $userId $pkg false"                                 // 标记为活跃
+"am set-standby-bucket --user $userId $pkg active"                          // 待机桶 → active
+"cmd appops set --user $userId $pkg RUN_ANY_IN_BACKGROUND allow"
+"cmd appops set --user $userId $pkg RUN_IN_BACKGROUND allow"
 ```
 
-> 直接用 Android Studio 打开这个目录也可以：它会提示生成 wrapper / 同步 Gradle。
-> 本仓库刻意不包含 `gradlew`、`gradlew.bat`、`gradle-wrapper.jar` 这些二进制文件。
-> `local.properties` 由脚本或上面第 1 步生成，**不要提交进版本库**（它是机器相关的）。
+> 只做这 5 条。唤醒锁、关闭整机省电、改 MIUI 自启动这类影响面大的开关**故意不做**：用户要的是「这个应用掉线」，不是「整机省电策略关掉」。
 
+**启动策略链**（`system/FreeformController.kt:137`）：从零特权到高特权逐级尝试，第一个成功即停，并记下成功的那条：
 
-安装并授权：
+1. App 内 `startActivity` + `ActivityOptions.setLaunchBounds()`（+ 反射 `setLaunchWindowingMode`，被 hidden-API 拦下就降级）
+2. `am start --user <U> -n <组件> --windowingMode 5 [--bounds l t r b]`
+3. 全屏 `am start` → `am task resize <id> l t r b`
+4. 厂商小窗广播（可选，装了对应模块才有）
 
-```powershell
-adb install -r app\\build\\outputs\\apk\\debug\\app-debug.apk
-# Shizuku 本身需要先通过 adb 或无线调试启动（Shizuku 官方说明）
-adb shell sh /storage/emulated/0/Android/data/moe.shizuku.privileged.api/start.sh
+**命令能力探测**（`FreeformController.kt:70`）：不猜「这个 ROM 支不支持 `--bounds`」，而是读一次 `am help` 的输出再决定走哪条策略（`TaskInspector` 与 `focus` 的可用性另由实测决定，因为 Android 17 的 `am help` 根本不列 `focus`）。
+
+**关闭一个应用**（`FreeformController.kt:350`）：只发 `force-stop` 不够——最近任务里的卡片还在，点它能冷启动回来。所以：
+
+```kotlin
+ShellRunner.exec("am force-stop --user $userId $packageName")  // 用户号必写：否则主系统与分身两份一起被杀
+ShellRunner.exec("am stack remove $id")                        // 摘掉后台卡片（`am task remove` 不存在）
 ```
 
-## 四、快速开始（建议顺序）
+**用户号必须一路带着**（`FreeformController.kt:119-135`）：不写 `--user` 时，装了手机分身的应用会弹出「选哪一个」的系统选择框，表现为启动失败。所有命令一律显式 `--user 0` 或 `--user 999`。
 
-1. **先不装 App**，跑能力探测（只读，改设置的命令都要你显式开开关）。两条路选一条，探测项完全相同：
+### 5.3 其他被真机逼出来的实现细节
 
-   | 跑在哪 | 命令 | 需要什么 |
-   | --- | --- | --- |
-   | PC（Windows） | `.\tools\probe-hyperos.ps1` | USB/无线调试 + adb |
-   | 手机 Termux | `bash tools/probe-hyperos.sh -p 你的游戏包名` | Shizuku + **rish**（见下） |
+- **落盘日志 `diag.log`**（`system/Diag.kt`）：这台机器把 logcat 的 main 缓冲区抽干了，读不到任何应用日志，所以关键事件自己写到 `Android/data/com.miniworld/files/diag.log`；1.12 起只记「失败 + 每 5 分钟一条心跳」。
+- **`resize` 必须复查**（`FreeformController.kt:275`）：只看退出码会被 ROM 骗过去，所以改完 sleep 250 ms 再回读 `dumpsys` 的矩形比对（容差 24 px）。
+- **地址串不能带逗号**：`am task resize` 要 4 个空格分隔的数字，逗号串必抛 `NumberFormatException`。
+- **焦点交还只发一条命令**（`WorkbenchController.kt:129`）：窗口被系统顶成 `topDisplayFocusedRootTask` 时，只对「用户此刻真正在看的那个任务」发一条 `am task focus`，**不动任何几何**；单应用小点模式下如果窗口在系统眼里仍可见，一拍都不抢前台——否则手势导航的侧滑返回会被 2×2 小点吃掉。
 
-   > ⚠️ Windows 默认禁止运行 `.ps1`，第一次跑会报「**在此系统上禁止运行脚本**」。两种解法：
-   > ① 在当前窗口先执行 `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`（只对当前窗口生效，
-   > 关掉即恢复，不改系统设置、不需要管理员）；② 或每条命令前加
-   > `powershell -NoProfile -ExecutionPolicy Bypass -File`。
+## 6. 构建与运行
 
-   Termux 上**必须走 rish**：Termux 自己的 uid 改不了 `settings put global`、开不了别的 display、
-   也看不到别人的任务。rish 是 Shizuku 官方脚本，让手机上的 shell 拿到 shell(uid=2000) 身份——
-   这正是本 App 最终要用的同一条通路，所以用它跑出来的结论是真结论。
-   准备方式：从 Shizuku 仓库取 `rish` 与 `rish_shizuku.dex` 放进 `$PATH`，确保 Shizuku 服务已启动。
+```bash
+# 需要：JDK 17、Android SDK（compileSdk 35）、Gradle 8.9+
+./gradlew assembleDebug testDebugUnitTest        # APK → app/build/outputs/apk/debug/
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
-   **M2 的 go/no-go 只要多一个开关**（临时建虚拟屏看 App 是否保持 `RESUMED`，退出自动还原）：
+Windows 上仓库自带 `tools/build-apk.bat` 与 `tools/setup-build-env.ps1`。单测共 **29 个用例 / 4 个纯 JVM 测试文件**（`AppTargetsTest`、`LayoutEngineTest`、`TickPolicyTest`、`TaskInspectorTest`），不需要设备。
 
-   ```bash
-   # Termux
-   pkg install gawk coreutils grep sed findutils    # Termux 基础环境不一定带 awk
-   bash tools/probe-hyperos.sh --selftest           # 先验脚本自己的解析器（不碰手机）
-   PROBE_MODE=rish bash tools/probe-hyperos.sh -p 你的挂机游戏包名 --vd
-   ```
+跑起来需要三步：
 
-   > ⚠️ **参数直接写包名，不要加尖括号。** `<` 在 PowerShell 与 Bash 里都是特殊字符：
-   > PowerShell 报「运算符"<"是为将来使用而保留的」，Bash 把它当输入重定向。
-   > PC 端同理：`-TestPackage com.example.game`，**不要**写成 `-TestPackage <com.example.game>`。
+1. 装 [Shizuku](https://shizuku.rikka.app/) 并用 adb / 无线调试启动它的服务；
+2. 打开须弥芥子，首页三行权限全绿（Shizuku / 悬浮窗 / 通知）；
+3. 「更换」选一个应用 → 「启动」。图标条出现后点图标即浮出、再点收回；「关闭」结束它并摘卡片。
 
-2. 装 App → 打开 → 「授权 Shizuku」→ 点「一键自检」，对照 `docs/03-真机验证清单.md`。
-3. 「场景」页新建场景：挑 2–4 个 App，选一个布局预设（上下 2、左右 2、主位 + 侧栏、四宫格）。
-4. 点「开工」：App 逐个以小窗拉起、按布局铺位、浮出侧边 Dock。
-5. 侧边浮出 Dock：**单击图标** = 该 App 换到主位（其余自动重排，不重启应用）；
-   **长按图标** = 该 App 加入 / 移出挂机保活；**拖动 Dock 空白处** = 换位置；
-   底部三个按钮 = **布局 / 保活 / 收工**。
-6. 「收工」：所有窗口回全屏并撤销保活（还有「收工并关闭应用」的强版本）。
+## 7. fork 之后怎么适配自己的手机
 
-## 五、已知限制（务必先读）
+代码里**没有硬编码任何目标应用**，没有 root / 无障碍依赖；要改的基本只有「设备相关常量」。推荐流程：
 
-- **第三方 App 自己暂停**：部分游戏在 `onWindowFocusChanged(false)` 时主动停止绘制甚至暂停逻辑。
-  系统层面无法强制它继续，只能靠"窗口可见即 resumed"绕过绝大多数情况。
-  小米官方的自由窗口适配文档第 6 条正是描述这个坑。
-- **同一 App 多开**：本方案是"多个不同 App 同屏"，不是"同一个游戏开多号"。后者需要应用分身/多用户沙箱，不在此列。
-- **功耗与发热**：N 个游戏同时渲染 = N 份 CPU/GPU 开销。3 个以上全尺寸窗口在手机上必然降频，请按"1 主 + 2 迷你"设计场景。
-- **系统设置可能被重置**：`enable_freeform_support` 这类全局开关在 ROM 升级、恢复出厂后会被重置，
-  且**修改后通常需要重启一次**才生效（AMS 在开机时读取该值）。App 提供「开机自检并提示」而不是静默改写。
-- **ROM 差异**：所有 shell 命令都在 `docs/02-架构与命令映射.md` 里配了回退链；任何一条在澎湃 OS 4 上失效，
-  自检页会明确标红，而不是静默失败。
+**第 0 步：先测命令面，别先改代码**
 
-## 六、参考
+```bash
+adb shell 'am help' | grep -E 'windowingMode|--bounds|resize <TASK_ID>|focus'
+adb shell 'am task resize <id> 0 0 100 100'    # 真跑一次，看是成功还是 Unknown command
+adb shell dumpsys activity activities | head -40   # 确认能读到 * Task{...} 与 bounds
+```
 
-- 小米澎湃 OS 开发者文档《[全局自由窗口适配说明](https://dev.mi.com/xiaomihyperos/documentation/detail?pId=1593)》
-  —— 官方确认「MIUI 的小窗是基于 Android 的多窗口 Freeform 方案实现的」，并指出多窗口下 App 应支持 multi-resume。
-- Android 开源项目《[Multi-resume](https://source.android.google.cn/docs/core/display/multi_display/multi-resume)》
-- Shizuku API：<https://github.com/RikkaApps/Shizuku-API>
-- 同类免 root 实现思路参考：[m-secret/FlymeFreeform](https://github.com/m-secret/FlymeFreeform)（ColorOS 上的无障碍 + 悬浮窗 + Shizuku 组合）
-- HyperOS 自由窗口的 shell 接口参考：[hyper_freeform_x](https://github.com/Xposed-Modules-Repo/cn.liuyi.hyper_freeform_x)
-  （Xposed 模块，本项目的 `MIUI_FREEFORM` 档位可**可选**复用它广播的接口）
+`tools/probe-hyperos.ps1`（Windows）/ `tools/probe-hyperos.sh` 会把这一圈探测跑完。
 
-## 七、许可
+**第 1 步：只改这些常量**（一次改一个，改完跑 `./gradlew testDebugUnitTest`）
 
-本仓库为个人项目，代码可自由使用与修改；引用的第三方接口与商标归各自所有者。
+| 想改什么 | 改哪里 | 什么时候需要改 |
+|---|---|---|
+| 小点外移量 | `WorkbenchController.kt` 的 `DOT_OUT_X/Y`（16/34） | 屏幕上还能看到一条边/一圈装饰 → 加大；完全看不见后可以减小 |
+| 节拍 | `TickPolicy.kt` 的 `TICK_MS` / `TICK_MS_SCREEN_OFF` | 想更省电（熄屏 30 s）或更跟手（熄屏 10 s） |
+| 浮窗比例 | `WorkbenchController.kt` 的 `overlayBounds()`（3/4 与 9/16） | 你的目标应用不是 16:9 横屏；或想要更大的浮窗 |
+| Dock 宽度 / 图标 / 淡化 | `DockView.kt` 的 `WIDTH_DP = 48f`、`iconSize = 40f`、`idleAlpha = 0.35f` | Dock 挡屏幕或太小点不着 |
+| 系统栏兜底 | `ScreenMetrics.kt` 的 26dp / 16dp | 你的 ROM 读不到 `status_bar_height`，导致窗口被状态栏压住 |
+| 包名 | `app/build.gradle.kts` 的 `applicationId` | 想和别人的安装包共存 |
+
+**第 2 步：三个「可选开关」**
+
+- **你的 ROM 不给自由窗口画装饰** → 小点可以放回屏幕内右下角（把 `dotBounds()` 改成 `Bounds(w-2, h-2, w, h)`），可读性更好；
+- **你的机器 logcat 正常** → 可以把 `Diag.log` 换成普通 `Log`，不必落盘；
+- **你没有小米手机分身** → `userId` 恒为 0，999 相关分支可以完全忽略（不用删）。
+
+**第 3 步：验收（在真机上一项项过）**
+
+1. 小点在屏幕上真的看不见（含转屏）；
+2. 挂机 10 分钟后目标进程仍是 `curProcState=2`（TOP）、`isFrozen=false`；
+3. 侧滑返回（手势导航）正常落在你正在用的应用上，不会被小点吃掉；
+4. 上滑回桌面 / 打开别的竖屏应用后，窗口最多 2 s 内被扔回屏幕外；
+5. 点 Dock 图标能浮出、再点能收回；「关闭」后最近任务里没有卡片。
+
+**第 4 步：vibecoding 的推荐姿势**
+
+把本 README 的 §5.1 参数表 + §7 的两张表原样丢给 AI，然后要求：
+
+> 「只改设备相关常量，不改架构；每改一处跑一次 `./gradlew testDebugUnitTest`；改完告诉我该在真机上验证哪几条。」
+
+架构稳定、常量集中、纯函数有单测——这正是为了让 AI 改得动而刻意保持的形状。
+
+## 8. 已知限制与注意事项
+
+- **ROM 省电策略可能把整个进程挂起**（本机实测过 13.5 分钟零执行）。应用侧有三层自愈：单拍异常仍旧续拍、60 s 巡检补拍、10 分钟闹钟兜底；但**请务必在系统设置里把本应用设为「无限制」省电并允许自启动**，否则兜底也可能一起被冻住。
+- **服务未导出**（`exported=false`，安全考虑）：只能通过界面启停，不能从 adb 直接拉起；自动化测试请用 `input tap`，并确保屏幕亮、且本应用窗口在最前。
+- **悬浮窗权限与 Shizuku 是硬门槛**，两者缺一应用基本不可用。
+- **本机实测（1.12）**：后台亮屏连续 26 分钟零漏拍，心跳 5 分钟一条（抖动 <200 ms）。
+- `diag.log` 上限 512 KB，超了整个文件重来（只记关键事件，正常不会到）。
+- 「关闭」走 `force-stop` + `am stack remove`；摘卡片依赖 ROM 把任务 id 当 root task id（现代 Android 成立）。
+- 非本机机型 / 非小米 ROM 可以跑，但 §5.1 的参数都需要按 §7 重调。
+
+## 9. 目录结构
+
+```
+app/src/main/java/com/miniworld/
+├── MainActivity.kt / App.kt        # 唯一界面与入口
+├── apps/AppCatalog.kt              # 可挂机应用清单
+├── data/SceneStore.kt              # 场景持久化（含 userId）
+├── model/                          # Bounds / Slot / LiveWindow / AppTargets
+├── service/
+│   ├── WorkbenchService.kt         # 前台服务（唯一入口：START / STOP 动作）
+│   ├── DockView.kt                 # 悬浮图标条（自绘 View）
+│   └── BootReceiver.kt             # 开机恢复
+├── shizuku/                        # ShellRunner / ShizukuGateway（shell 通道）
+├── system/
+│   ├── FreeformController.kt       # 自由窗口：启动策略链 / resize / focus / 关闭
+│   ├── TaskInspector.kt            # 解析 dumpsys，拿任务与窗口状态
+│   ├── KeepAlive.kt                # 5 条保活命令 + 只读审计
+│   ├── ScreenMetrics.kt            # 屏幕尺寸与系统栏内缩
+│   └── Diag.kt                     # 落盘日志
+├── ui/WorkbenchRoot.kt             # Compose 首页
+└── window/
+    ├── WorkbenchController.kt      # 编排器 + 看门狗（本项目的心脏）
+    ├── LayoutEngine.kt             # 纯函数布局
+    └── TickPolicy.kt               # 纯函数节拍策略
+
+app/src/test/…                      # 29 个 JVM 单测
+docs/                               # 项目文档 / 开发文档 / 版本记录 / 真机验证清单
+snapshots/                          # 每个版本的快照（含 APK）
+tools/                              # 构建、探测、验证、发布脚本
+```
+
+## 10. 开发 / 验证工具
+
+| 文件 | 用途 |
+|---|---|
+| `tools/probe-hyperos.ps1` / `.sh` | 一次性探测本机 `am` 命令面与窗口能力 |
+| `tools/verify-layout.py` / `verify-taskinspector.py` / `verify-probe-sh.py` | 离线核对纯函数输出与 `dumpsys` 解析 |
+| `tools/build-apk.bat` / `setup-build-env.ps1` | Windows 上开箱构建 |
+| `tools/release.ps1` / `.cmd` | 一把跑完：版本号 → 编译+单测 → 装机核对 → 快照 → commit → tag |
+| `tools/doc-sync.ps1` / `.cmd` | 按锚点表批量改文档（`路径 \|\|\| 原文 \|\|\| 新文`，支持 `-Check` 只报不改） |
+
+## 11. 版本与快照
+
+每个可用的版本都在 `snapshots/<版本>-<一句话>/` 下留了一份完整快照（源码 + `须弥芥子-<版本>.apk`），并打了同名 git tag。详细改动见 [docs/版本记录.md](docs/版本记录.md)。
+
+| 版本 | 一句话 | 快照目录 |
+|---|---|---|
+| 1.0 | 首个可用正式版 | `snapshots/1.0-正式版` |
+| 1.01 | 项目改名为 miniworld | `snapshots/1.01-改名版` |
+| 1.02 | 修复手机分身误伤与收工遗留 | `snapshots/1.02-分身与收工修复` |
+| 1.1 | 小点移到屏幕外 + 修复侧滑返回失效 | `snapshots/1.1-屏幕外小点与侧滑修复` |
+| 1.11 | 看门狗降耗 + 日志降噪 | `snapshots/1.11-看门狗降耗与日志降噪` |
+| 1.12 | 熄屏降压 + 看门狗自检与闹钟兜底 | `snapshots/1.12-熄屏降压与看门狗自检` |
+
+> 早期还有一个被否决的试验包（3.5），因此正式版号从 3.6 之后重新按 1.x 排列。
+
+## 12. 免责声明
+
+本项目按「现状」提供，仅供学习、研究与个人使用；作者不对任何数据丢失、账号风险或违反第三方应用服务条款的后果负责。请遵守你所在地区的法律法规与相关应用的用户协议。
+
+## 13. License
+
+[MIT](LICENSE) © 2026 Morgan00GZ —— 随便用、随便改，出事别找我（详见 [LICENSE](LICENSE)）。
