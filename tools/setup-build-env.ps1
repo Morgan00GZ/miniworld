@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     miniworld 一键搭建编译环境 + 编译出 APK（Windows）
 

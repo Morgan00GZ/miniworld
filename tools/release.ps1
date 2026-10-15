@@ -1,4 +1,4 @@
-<#
+﻿<#
 release.ps1 - one-shot release for miniworld: version bump -> build -> install -> snapshot -> commit -> tag.
 Prints only a short summary (never the full gradle log).
 
