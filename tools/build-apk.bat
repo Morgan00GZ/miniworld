@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM  OneStep Workbench - build APK (double-click me)
+REM  miniworld - build APK (double-click me)
 REM  All Chinese messages come from setup-build-env.ps1
 REM ============================================================
 setlocal
@@ -27,7 +27,7 @@ if exist "%~dp0_argtest.ps1" del /q "%~dp0_argtest.ps1" >nul 2>nul
 if exist "%~dp0_argtest" rmdir /s /q "%~dp0_argtest" >nul 2>nul
 
 echo.
-echo Building OneStep Workbench APK ...
+echo Building miniworld APK ...
 echo (first run downloads JDK + Android SDK + Gradle, about 500MB)
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" %*

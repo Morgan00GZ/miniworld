@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    OneStep Workbench 一键搭建编译环境 + 编译出 APK（Windows）
+    miniworld 一键搭建编译环境 + 编译出 APK（Windows）
 
 .DESCRIPTION
     这台电脑上还没有 Java / Android SDK / Gradle，所以第一次编译需要先把它们装好。
@@ -156,7 +156,7 @@ trap {
 
 Say ""
 Say "=============================================================="
-Say "  OneStep Workbench - 一键编译环境"
+Say "  miniworld - 一键编译环境"
 Say "=============================================================="
 Say "  项目目录  : $ProjDir"
 Say "  工具链目录: $Root"
