@@ -268,7 +268,10 @@ tools/                              # 构建、探测、验证、发布脚本
 | `tools/verify-layout.py` / `verify-taskinspector.py` / `verify-probe-sh.py` | 离线核对纯函数输出与 `dumpsys` 解析 |
 | `tools/build-apk.bat` / `setup-build-env.ps1` | Windows 上开箱构建 |
 | `tools/release.ps1` / `.cmd` | 一把跑完：版本号 → 编译+单测 → 装机核对 → 快照 → commit → tag |
+| `tools/release-gh.ps1` / `.cmd` | 发 GitHub Release：说明自动取 `docs/版本记录.md` 对应小节，附件取快照里的 APK（`-DryRun` 只看不发，`-Force` 覆盖已发的） |
 | `tools/doc-sync.ps1` / `.cmd` | 按锚点表批量改文档（`路径 \|\|\| 原文 \|\|\| 新文`，支持 `-Check` 只报不改） |
+
+发完版本记得把 tag 一起推上去：`git push origin main --tags`。
 
 ## 11. 版本与快照
 
