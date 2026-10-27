@@ -269,7 +269,10 @@ tools/                              # 构建、探测、验证、发布脚本
 | `tools/build-apk.bat` / `setup-build-env.ps1` | Windows 上开箱构建 |
 | `tools/release.ps1` / `.cmd` | 一把跑完：版本号 → 编译+单测 → 装机核对 → 快照 → commit → tag |
 | `tools/release-gh.ps1` / `.cmd` | 发 GitHub Release：说明自动取 `docs/版本记录.md` 对应小节，附件取快照里的 APK（`-DryRun` 只看不发，`-Force` 覆盖已发的） |
+| `tools/Push-To-GitHub.cmd` | 一把提交并推送（`git add -A` → commit → `git push origin main --tags`） |
 | `tools/doc-sync.ps1` / `.cmd` | 按锚点表批量改文档（`路径 \|\|\| 原文 \|\|\| 新文`，支持 `-Check` 只报不改） |
+
+这些 `.cmd` 都放在本仓库自己的 `tools/` 里，靠脚本位置认仓库根（上一级目录），所以换一台机器或另一个项目只要把 `tools/` 一起带走即可。`Push-To-GitHub.cmd` 会先找 `..\..\PortableGit\cmd\git.exe`，找不到再退回 PATH 上的 `git`。
 
 发完版本记得把 tag 一起推上去：`git push origin main --tags`。
 
