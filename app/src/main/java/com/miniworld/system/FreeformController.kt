@@ -71,9 +71,11 @@ object FreeformController {
         cachedSurface?.let { if (!force) return it }
 
         val help = ShellRunner.exec("am help", 10_000).combined
-        // `am task` 不带子命令在 Android 17 上直接抛 IllegalArgumentException（Argument expected after "task"），
-        // 拿不到子命令清单，所以判定只用 `am help`，这次调用仅作为线索保留在日志里。
-        ShellRunner.exec("am task", 8_000)
+        // 曾经的写法：额外跑一次 `am task`，想拿子命令清单当线索。
+        // 实测（Android 17 / HyperOS）它必定抛
+        //     IllegalArgumentException: Argument expected after "task"
+        // 拿不到任何清单，却每次进程启动多起一个 sh、还往 diag.log 写 1 KB 堆栈。
+        // 判定本来就只看 `am help`，"能不能用"最终由实测决定，所以这次调用直接去掉。
 
         // 真机教训：`am help` 的 task 段落里写的是**裸子命令名**：
         //     task [COMMAND] [...]: sub-commands for operating on activity tasks.

@@ -72,6 +72,9 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
     var selfCheckOpen by remember { mutableStateOf(false) }
     var selfCheckBusy by remember { mutableStateOf(false) }
     var selfCheck by remember { mutableStateOf<SelfCheckReport?>(null) }
+    // 上次采集的时刻。必须显示出来：面板展开后不会自己变，不标时间就会被当成"现在"，
+    // 实际踩过这个坑——点完启动再回来看，白名单还显示"✗ 不在"，其实设备上早就是 ✓ 了。
+    var selfCheckAt by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
     val shizuku by ShizukuGateway.state.collectAsState()
 
@@ -110,14 +113,23 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
             scope.launch {
                 val report = withContext(Dispatchers.IO) { SelfCheck.collect(shizukuLabel, pkg, uid) }
                 selfCheck = report
+                selfCheckAt = java.time.LocalTime.now().withNano(0).toString()
                 selfCheckBusy = false
             }
         }
     }
 
+    // 面板展开着的时候，运行状态一变（启动 / 关闭）就自动重采一次。
+    // 否则面板会一直停在打开那一刻的数字，看起来像"保活没生效"。
+    LaunchedEffect(running, selfCheckOpen) {
+        if (selfCheckOpen) runSelfCheck()
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
+            // 展开自检后内容会超过一屏，必须能滚，否则最后几行会被直接裁掉（真机上出现过）
+            .verticalScroll(rememberScrollState())
             .padding(20.dp)
     ) {
         Text("须弥芥子", fontSize = 24.sp, fontWeight = FontWeight.Bold)
@@ -211,10 +223,9 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
             open = selfCheckOpen,
             busy = selfCheckBusy,
             report = selfCheck,
-            onToggle = {
-                selfCheckOpen = !selfCheckOpen
-                if (selfCheckOpen && selfCheck == null) runSelfCheck()
-            },
+            at = selfCheckAt,
+            // 采集交给上面那个 LaunchedEffect(selfCheckOpen) 统一触发，这里只翻开关
+            onToggle = { selfCheckOpen = !selfCheckOpen },
             onRefresh = runSelfCheck
         )
 
@@ -292,12 +303,18 @@ private fun SelfCheckBlock(
     open: Boolean,
     busy: Boolean,
     report: SelfCheckReport?,
+    at: String,
     onToggle: () -> Unit,
     onRefresh: () -> Unit
 ) {
     Column(Modifier.fillMaxWidth()) {
         Text(
-            if (open) "自检 ▾" else "自检 ▸",
+            // 把采集时刻挂在标题上，一眼能看出这屏数字是什么时候的
+            when {
+                !open -> "自检 ▸"
+                at.isEmpty() -> "自检 ▾ · 正在读…"
+                else -> "自检 ▾ · $at"
+            },
             fontSize = 12.sp,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -315,20 +332,23 @@ private fun SelfCheckBlock(
                 )
             } else {
                 CheckLine("Shizuku", report.shizuku)
+                CheckLine("shell 用户", if (report.shellUser < 0) "读不到" else "${report.shellUser}")
                 CheckLine(
-                    "当前用户",
-                    if (report.currentUser < 0) "读不到"
-                    else "${report.currentUser}" + if (report.currentUser == 999) "（小米手机分身）" else ""
+                    "挂机用户",
+                    "${report.appUser}" + if (report.appUser == 999) "（小米手机分身）" else ""
                 )
-                CheckLine("保活", report.keepAlive)
-                CheckLine("冻结器", report.freezer)
-                CheckLine("自由窗口", report.freeformEnabled)
+                CheckLine("保活白名单", if (report.whitelisted) "✓ 在" else "✗ 不在")
+                CheckLine("后台运行", report.runAny)
+                CheckLine("待机桶", report.bucket)
+                // 冻结器 / 自由窗口都是系统开关，合成一行才塞得进一屏
+                CheckLine("设置", "冻结器 ${report.freezer} · 自由窗口 ${report.freeformEnabled}")
                 CheckLine(
-                    "dump 大小",
-                    "P50 ${report.dumpBytesP50 / 1024} KB · P95 ${report.dumpBytesP95 / 1024} KB"
+                    "dump",
+                    if (report.dumpCount == 0) "还没跑过（点启动后回来看）"
+                    else "${report.dumpBytesP50 / 1024} KB · ${report.dumpMillisP50} ms" +
+                        "（P50，共 ${report.dumpCount} 次）"
                 )
-                CheckLine("dump 耗时", "P50 ${report.dumpMillisP50} ms · P95 ${report.dumpMillisP95} ms")
-                CheckLine("本次运行", "dump ${report.dumpCount} 次 · 校正 ${report.corrections} 次")
+                CheckLine("校正次数", "${report.corrections} 次")
             }
             Text(
                 if (busy) "……" else "重新自检",
