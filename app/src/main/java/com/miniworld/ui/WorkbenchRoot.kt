@@ -25,6 +25,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -37,8 +38,11 @@ import com.miniworld.model.Slot
 import com.miniworld.service.WorkbenchService
 import com.miniworld.shizuku.ShizukuGateway
 import com.miniworld.shizuku.ShellRunner
+import com.miniworld.system.SelfCheck
+import com.miniworld.system.SelfCheckReport
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** 列表里的一项：主系统应用的 userId = 0；小米手机分身（XSpace）里的应用是 999。 */
@@ -64,6 +68,11 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
     var running by remember { mutableStateOf(false) }
     var overlayOk by remember { mutableStateOf(Settings.canDrawOverlays(activity)) }
     var notifyOk by remember { mutableStateOf(NotificationManagerCompat.from(activity).areNotificationsEnabled()) }
+    // 自检面板：默认收起，点开才跑命令（里面有几条 shell 查询，不该每次进主页都跑）
+    var selfCheckOpen by remember { mutableStateOf(false) }
+    var selfCheckBusy by remember { mutableStateOf(false) }
+    var selfCheck by remember { mutableStateOf<SelfCheckReport?>(null) }
+    val scope = rememberCoroutineScope()
     val shizuku by ShizukuGateway.state.collectAsState()
 
     LaunchedEffect(Unit) {
@@ -90,6 +99,21 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
     }?.label
         ?: current?.label
         ?: "未选择"
+
+    // 自检要跑 4~8 条 shell 查询，所以只在用户点的时候跑一次，放在 IO 线程上。
+    val runSelfCheck: () -> Unit = {
+        if (!selfCheckBusy) {
+            selfCheckBusy = true
+            val pkg = current?.packageName
+            val uid = current?.userId ?: 0
+            val shizukuLabel = if (shizuku.ready) "已授权（${shizuku.uidLabel}）" else "未授权"
+            scope.launch {
+                val report = withContext(Dispatchers.IO) { SelfCheck.collect(shizukuLabel, pkg, uid) }
+                selfCheck = report
+                selfCheckBusy = false
+            }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -182,6 +206,18 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
             }
         )
 
+        Spacer(Modifier.height(20.dp))
+        SelfCheckBlock(
+            open = selfCheckOpen,
+            busy = selfCheckBusy,
+            report = selfCheck,
+            onToggle = {
+                selfCheckOpen = !selfCheckOpen
+                if (selfCheckOpen && selfCheck == null) runSelfCheck()
+            },
+            onRefresh = runSelfCheck
+        )
+
         if (pickerOpen) {
             AlertDialog(
                 onDismissRequest = { pickerOpen = false },
@@ -241,6 +277,81 @@ private fun StatusLine(
             .fillMaxWidth()
             .clickable { onClick() }
             .padding(vertical = 6.dp)
+    )
+}
+
+/**
+ * 「自检」折叠区。
+ *
+ * 存在的理由很实际：以前任何问题都得「连电脑 → adb → 翻 512 KB 的 diag.log」，
+ * 而这些信息（Shizuku 的 uid、当前用户号、系统冻结器开没开、保活四项到底落没落地、
+ * 每拍 dump 多大多久）本来就都能在手机上查到。收起来时一个字符都不显示，不占地方。
+ */
+@Composable
+private fun SelfCheckBlock(
+    open: Boolean,
+    busy: Boolean,
+    report: SelfCheckReport?,
+    onToggle: () -> Unit,
+    onRefresh: () -> Unit
+) {
+    Column(Modifier.fillMaxWidth()) {
+        Text(
+            if (open) "自检 ▾" else "自检 ▸",
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onToggle() }
+                .padding(vertical = 6.dp)
+        )
+        if (open) {
+            if (report == null) {
+                Text(
+                    if (busy) "正在自检…" else "正在准备…",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                CheckLine("Shizuku", report.shizuku)
+                CheckLine(
+                    "当前用户",
+                    if (report.currentUser < 0) "读不到"
+                    else "${report.currentUser}" + if (report.currentUser == 999) "（小米手机分身）" else ""
+                )
+                CheckLine("保活", report.keepAlive)
+                CheckLine("冻结器", report.freezer)
+                CheckLine("自由窗口", report.freeformEnabled)
+                CheckLine(
+                    "dump 大小",
+                    "P50 ${report.dumpBytesP50 / 1024} KB · P95 ${report.dumpBytesP95 / 1024} KB"
+                )
+                CheckLine("dump 耗时", "P50 ${report.dumpMillisP50} ms · P95 ${report.dumpMillisP95} ms")
+                CheckLine("本次运行", "dump ${report.dumpCount} 次 · 校正 ${report.corrections} 次")
+            }
+            Text(
+                if (busy) "……" else "重新自检",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onRefresh() }
+                    .padding(vertical = 6.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun CheckLine(label: String, value: String) {
+    Text(
+        "$label：$value",
+        fontSize = 12.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
     )
 }
 

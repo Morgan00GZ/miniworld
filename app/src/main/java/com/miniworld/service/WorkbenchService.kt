@@ -211,7 +211,7 @@ class WorkbenchService : Service(), DockView.Listener {
             )
         }
         val primary = live.firstOrNull()?.slotIndex ?: source.first()
-        view.update(entries, primary, state.keepAliveOn)
+        view.update(entries, primary)
     }
 
     private fun createDock(): DockView? = runCatching {
@@ -254,14 +254,26 @@ class WorkbenchService : Service(), DockView.Listener {
         controller.onDockTap(slotIndex)
     }
 
+    /**
+     * 长按图标 = **重新施加**一次保活（幂等，只加不减）。
+     *
+     * 旧写法是「不在白名单里就加、已经在就撤」——但开工时已经自动加过了，
+     * 于是实际效果变成「手一抖按住半秒，反而把保活关掉了」，和
+     * 「保活是必需的，不提供开关」自相矛盾（真机反馈确认这一点）。
+     *
+     * 现在只补不减：系统把设置弄丢了可以补回来，但**没有任何操作能把保活弄没**，
+     * 只有「关闭」会撤销。
+     */
     override fun onSlotLongPress(slotIndex: Int) {
         val window = controller.currentState().windows.firstOrNull { it.slotIndex == slotIndex } ?: return
         val pkg = window.packageName
+        val who = "$pkg${if (window.userId == 0) "" else "（分身）"}"
         Thread {
-            val audit = KeepAlive.audit(pkg, window.userId)
-            val enable = !audit.inDeviceIdleWhitelist
-            KeepAlive.apply(pkg, window.userId, enable)
-            toast("$pkg${if (window.userId == 0) "" else "（分身）"} ${if (enable) "已加入挂机保活" else "已移出挂机保活"}")
+            val batch = KeepAlive.applyBatch(pkg, window.userId, enable = true)
+            toast(
+                if (batch.ok) "$who 已重新保活"
+                else "$who 保活有 ${batch.failed.size} 项没成功，去主页「自检」里看"
+            )
         }.start()
     }
 

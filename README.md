@@ -152,7 +152,9 @@ ShellRunner.exec("am stack remove $id")                        // 摘掉后台�
 ### 5.3 其他被真机逼出来的实现细节
 
 - **落盘日志 `diag.log`**（`system/Diag.kt`）：这台机器把 logcat 的 main 缓冲区抽干了，读不到任何应用日志，所以关键事件自己写到 `Android/data/com.miniworld/files/diag.log`；1.12 起只记「失败 + 每 5 分钟一条心跳」。
-- **`resize` 必须复查**（`FreeformController.kt:275`）：只看退出码会被 ROM 骗过去，所以改完 sleep 250 ms 再回读 `dumpsys` 的矩形比对（容差 24 px）。
+- **`resize` 按需复查**（`FreeformController.kt:275`，`verify` 参数）：只看退出码会被 ROM 骗过去，所以要回读 `dumpsys` 的矩形比对（容差 24 px）。但这次回读本身又是一份约 72 KB 的 `dumpsys`，所以只有「结论要参与决策」的调用方才复查；纯摆位的调用方传 `verify = false`，交给下一拍统一判定。
+- **主页「自检 ▸」**（`system/SelfCheck.kt` + `system/Metrics.kt`）：默认收起，点开才跑几条只读命令，显示 Shizuku uid / 当前用户（分身 999）/ 保活四项 / 冻结器 / 自由窗口开关 / 每拍 `dumpsys` 的大小与耗时 / 本次运行的 dump 与校正次数。排障不必再连电脑读 `diag.log`。
+- **保活命令合并成一条**（`system/KeepAlive.kt` 的 `applyBatch`）：5 条命令用 `;` 拼成一条 `sh` 脚本，每条挂 `|| echo __FAIL__:key`，靠标记还原每一步的成败——语义不变，但从 5 个 `sh` 进程变成 1 个。
 - **地址串不能带逗号**：`am task resize` 要 4 个空格分隔的数字，逗号串必抛 `NumberFormatException`。
 - **焦点交还只发一条命令**（`WorkbenchController.kt:129`）：窗口被系统顶成 `topDisplayFocusedRootTask` 时，只对「用户此刻真正在看的那个任务」发一条 `am task focus`，**不动任何几何**；单应用小点模式下如果窗口在系统眼里仍可见，一拍都不抢前台——否则手势导航的侧滑返回会被 2×2 小点吃掉。
 

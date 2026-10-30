@@ -49,6 +49,63 @@ object KeepAlive {
 
     data class Applied(val step: Step, val result: ShellResult, val success: Boolean)
 
+    /** [applyBatch] 的结果：逐条成功与否已经还原好，调用方只看 [failed] 就行。 */
+    data class BatchResult(
+        val steps: List<Step>,
+        val failed: List<Step>,
+        val output: String
+    ) {
+        val ok: Boolean get() = failed.isEmpty()
+    }
+
+    /** 每条命令后面挂的失败标记；`sh` 里 `cmd || echo MARK` 只在 cmd 非 0 时才打印。 */
+    private const val FAIL_MARK = "__FAIL__:"
+
+    /**
+     * 把多条命令拼成一条 `sh` 脚本。
+     *
+     * 为什么合并：单条 [ShellRunner.exec] 都要经过 Shizuku 起一个 `sh` 进程，
+     * 5 条就是 5 次进程创建；合并成一条后只在第一次付这份开销。
+     * 命令本身**一条都不改**，只是在每条后面挂 `|| echo __FAIL__:key`，
+     * 这样某一条失败也不会挡住后面的命令（`||` 只吃掉这一条的失败）。
+     */
+    internal fun buildBatchScript(steps: List<Step>): String =
+        steps.joinToString("; ") { "${it.command} || echo $FAIL_MARK${it.key}" }
+
+    /**
+     * 从合并输出里还原出"哪几条失败了"。
+     *
+     * 必须按行精确比对标记，不能用 `contains("Error")` 之类的模糊判断：
+     * 失败标记是命令输出的一部分，而命令本身可能把 `Error` 写进正常输出里。
+     */
+    internal fun parseBatchFailures(steps: List<Step>, output: String): List<Step> {
+        val seen = output.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith(FAIL_MARK) }
+            .map { it.removePrefix(FAIL_MARK).trim() }
+            .toSet()
+        return steps.filter { it.key in seen }
+    }
+
+    /**
+     * 一次下发全部保活步骤（[applyBatch] 与 [apply] 的命令、顺序、语义完全一致）。
+     *
+     * 与 [apply] 的差别只有一个：**一个 sh 进程**做完 5 条，而不是 5 个。
+     */
+    fun applyBatch(pkg: String, userId: Int, enable: Boolean): BatchResult {
+        val steps = if (enable) enableSteps(pkg, userId) else disableSteps(pkg, userId)
+        val result = ShellRunner.exec(buildBatchScript(steps), 20_000)
+        val failed = parseBatchFailures(steps, result.combined)
+        if (failed.isNotEmpty()) {
+            Log.w(
+                TAG,
+                "保活批量下发：${failed.size}/${steps.size} 步失败（" +
+                    failed.joinToString("、") { it.label } + "）\n${result.describe()}"
+            )
+        }
+        return BatchResult(steps, failed, result.combined)
+    }
+
     fun apply(pkg: String, userId: Int, enable: Boolean): List<Applied> {
         val steps = if (enable) enableSteps(pkg, userId) else disableSteps(pkg, userId)
         return steps.map { step ->

@@ -406,10 +406,13 @@ class WorkbenchController(context: Context) {
             if (task.bounds != target) {
                 // 和弹出时一样走"先小后大"两步：单次 resize 在转屏之后经常不生效，
                 // 结果就是"收起状态下转一下屏，浮窗又自己弹出来"（真机 m02032 第二条）。
-                FreeformController.resizeTask(task.taskId, scaled(target, 3, 5))
+                FreeformController.resizeTask(task.taskId, scaled(target, 3, 5), verify = false)
                 Thread.sleep(200)
-                FreeformController.resizeTask(task.taskId, target)
+                // 两步都不复查：这一拍开头已经有 dump 了，下一拍还会再读一次，
+                // 中间多查两遍只是把同一份 72 KB 读两遍（一拍一份 dump）。
+                FreeformController.resizeTask(task.taskId, target, verify = false)
                 Diag.log(TAG, "校正：${window.packageName} ${task.bounds} -> $target")
+                com.miniworld.system.Metrics.bumpCorrection()
                 moved = true
             }
         }
@@ -577,7 +580,7 @@ class WorkbenchController(context: Context) {
                     val component = (slot.component ?: catalog.find(slot.packageName)?.component)?.let { if (slot.userId != 0) "$it@${slot.userId}" else it }
                     val task = TaskInspector.find(slot.packageName, slot.userId) ?: return@forEachIndexed
                     if (task.bounds != target) {
-                        FreeformController.resizeTask(task.taskId, target)
+                        FreeformController.resizeTask(task.taskId, target, verify = false)
                         drifted++
                         if (!task.isFreeform && relaunched < 2 && component != null) {
                             // 极少数应用 resize 后仍不在自由窗口：最多补拉两次，避免反复闪屏
@@ -679,7 +682,7 @@ class WorkbenchController(context: Context) {
         if (!onlyOne && slotIndex == primarySlot) {
             ordered.drop(1).forEach { other ->
                 TaskInspector.find(other.packageName, other.userId)?.let { task ->
-                    FreeformController.resizeTask(task.taskId, dotBounds())
+                    FreeformController.resizeTask(task.taskId, dotBounds(), verify = false)
                 }
             }
             update { it.copy(manualOverlay = null, message = "其他应用已收回后台（仍在下点里运行）") }
@@ -707,10 +710,12 @@ class WorkbenchController(context: Context) {
         if (isDot) {
             // 先摆到中间尺寸再放大：两次尺寸变化会给应用派发一次配置变化，
             // 用来替代"手动切一次横竖屏"（本机 shell 锁不了屏幕方向，见 m02016）。
-            FreeformController.resizeTask(task.taskId, scaled(next, 3, 5))
+            FreeformController.resizeTask(task.taskId, scaled(next, 3, 5), verify = false)
             Thread.sleep(350)
         }
-        FreeformController.resizeTask(task.taskId, next)
+        // 不复查：紧跟着就会 find 一次做最终校验（见下面的 `val after`），
+        // 由那次的结果决定要不要补拉，这里再查一遍纯属重复。
+        FreeformController.resizeTask(task.taskId, next, verify = false)
         FreeformController.focusTask(task.taskId, target.component)
         // resize 之后只校验、**不再重新拉起 App**：
         // 真机实测（10-10 10:05 的 diag 日志）我们的启动命令**全都带了 --user 999**，
@@ -753,7 +758,7 @@ class WorkbenchController(context: Context) {
         val pkg = current.manualOverlay ?: return@submit
         current.windows.filter { it.packageName == pkg }.forEach { window ->
             TaskInspector.find(window.packageName, window.userId)?.let { task ->
-                FreeformController.resizeTask(task.taskId, dotBounds())
+                FreeformController.resizeTask(task.taskId, dotBounds(), verify = false)
             }
         }
         update { it.copy(manualOverlay = null, message = "已收起浮窗") }
@@ -814,8 +819,9 @@ class WorkbenchController(context: Context) {
         if (targets.isEmpty()) return "没有可保活的应用"
         val log = ArrayList<String>()
         targets.forEach { target ->
-            val applied = KeepAlive.apply(target.packageName, target.userId, enable)
-            val failed = applied.filterNot { it.success }
+            // 一次下发：一个 sh 进程做完 5 条（原来是 5 条命令 = 5 个进程，约 600 ms）
+            val batch = KeepAlive.applyBatch(target.packageName, target.userId, enable)
+            val failed = batch.failed
             log += "${if (failed.isEmpty()) "✓" else "!"} ${target.label}：${if (enable) "已保活" else "已撤销"}" +
                 if (failed.isEmpty()) "" else "（${failed.size} 项不支持）"
         }

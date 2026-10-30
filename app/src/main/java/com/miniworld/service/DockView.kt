@@ -88,7 +88,6 @@ class DockView(context: Context) : View(context) {
 
     private var entries: List<Entry> = emptyList()
     private var primarySlot = 0
-    private var keepAliveOn = false
 
     private var pressedSlot: Int? = null
     private var longPressFired = false
@@ -103,10 +102,9 @@ class DockView(context: Context) : View(context) {
         listener?.onSlotLongPress(slot)
     }
 
-    fun update(entries: List<Entry>, primarySlot: Int, keepAliveOn: Boolean) {
+    fun update(entries: List<Entry>, primarySlot: Int) {
         this.entries = entries
         this.primarySlot = primarySlot
-        this.keepAliveOn = keepAliveOn
         requestLayout()
         invalidate()
         // 每次刷新内容都重置"变淡"计时：用户刚看过，不该立刻淡下去。

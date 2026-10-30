@@ -264,22 +264,34 @@ object FreeformController {
             return task
         }
         log += "    → 落点 ${task.bounds ?: "读不到"}，按目标 [${bounds.toResizeArgs()}] 再 resize"
-        val ok = resizeTask(task.taskId, bounds)
+        // verify = false：下面那行马上就自己 listTasks() 一次，让 resizeTask 再查一遍纯属重复
+        val ok = resizeTask(task.taskId, bounds, verify = false)
         log += "    → resize ${if (ok) "成功" else "失败（或读不到 bounds，按退出码判断）"}"
         return TaskInspector.listTasks().firstOrNull { it.taskId == task.taskId } ?: task
     }
 
     // ------------------------------------------------------------------ 窗口操作
 
-    /** 改窗口大小，并**复查**是否真的改了（只看退出码会被 ROM 骗过去）。 */
-    fun resizeTask(taskId: Int, bounds: Bounds): Boolean {
+    /**
+     * 改窗口大小，并按需**复查**是否真的改了（只看退出码会被 ROM 骗过去）。
+     *
+     * @param verify 是否复查。复查要额外跑一次**全量** `dumpsys activity activities`
+     *   （实测约 72 KB、经 Shizuku 起一个 sh 进程），所以只有「结论要参与后续决策」的调用方需要；
+     *   纯摆位的调用方（看门狗校正、Dock 切换、收起浮窗）传 false ——
+     *   它们的下一拍本来就会重新读窗口位置，多读这一份纯属重复。
+     *
+     *   注意 [Thread.sleep] 那 250 ms 与 verify **无关**：那是给 ROM 落位的节奏，
+     *   紧接着再发一条 resize 时太快会把上一条还没落地的尺寸再改一次，所以一律保留。
+     */
+    fun resizeTask(taskId: Int, bounds: Bounds, verify: Boolean = true): Boolean {
         // 注意：这里是四个分开的数字（toResizeArgs），不是逗号串——真机实测逗号串必抛 NumberFormatException
         val result = ShellRunner.exec("am task resize $taskId ${bounds.toResizeArgs()}")
-        if (result.contains("Error") || result.contains("Unknown")) {
+        if (rejectedByRom(result.combined)) {
             Log.w(TAG, "resize 被拒：${result.describe()}")
             return false
         }
         Thread.sleep(250)
+        if (!verify) return result.ok || result.combined.isEmpty()
         val task = TaskInspector.listTasks().firstOrNull { it.taskId == taskId }
         if (task?.bounds == null) {
             // ROM 没暴露 bounds，只能相信退出码——把它记下来，别假装验证过了
@@ -288,6 +300,18 @@ object FreeformController {
         }
         return boundsClose(task.bounds, bounds)
     }
+
+    /**
+     * ROM 用这几个词表示「命令没被执行」。
+     *
+     * 抽成纯函数是为了能单测：真机上「被拒」和「成功但没生效」很难稳定复现，
+     * 而认错这两个词的后果很实在——`am task resize` 失败却被当成成功，
+     * 后面所有基于「窗口已就位」的判断就全歪了。
+     */
+    internal fun rejectedByRom(output: String): Boolean =
+        output.contains("Error", ignoreCase = true) ||
+            output.contains("Unknown", ignoreCase = true) ||
+            output.contains("Exception", ignoreCase = true)
 
     /**
      * 把指定任务前置（"一键切换主位"的底层动作）。

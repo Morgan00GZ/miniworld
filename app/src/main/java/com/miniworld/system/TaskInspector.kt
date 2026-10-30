@@ -70,7 +70,21 @@ object TaskInspector {
     private val BOUNDS = rx("""mBounds=Rect\((-?\d+),\s*(-?\d+)\s*-\s*(-?\d+),\s*(-?\d+)\)""")
     private val ACTIVITY = rx("""ActivityRecord\{[^}]*\s([A-Za-z0-9_.]+)/([A-Za-z0-9_.$]+)""")
 
-    fun dump(): String = ShellRunner.exec("dumpsys activity activities", 15_000).stdout
+    fun dump(): String = runDump().stdout
+
+    /**
+     * 真正发命令的唯一入口：一条 `dumpsys activity activities`。
+     *
+     * 大小与耗时只记进 [Metrics]（给主页「自检」面板看），**不写 diag.log**：
+     * 那个文件是给失败用的，正常一拍一写会把 512 KB 顶满、整个文件被删重来，
+     * 反而看不到真正要排的那次故障。
+     */
+    private fun runDump(): com.miniworld.shizuku.ShellResult {
+        val started = System.currentTimeMillis()
+        val result = ShellRunner.exec("dumpsys activity activities", 15_000)
+        Metrics.recordDump(result.stdout.length, System.currentTimeMillis() - started)
+        return result
+    }
 
     /**
      * 同 [dump]，但命令没跑成时返回 null。
@@ -79,7 +93,7 @@ object TaskInspector {
      * **整拍跳过** —— 绝不能把"没查到"当成"任务都不见了"去动窗口。
      */
     fun dumpOrNull(): String? {
-        val result = ShellRunner.exec("dumpsys activity activities", 15_000)
+        val result = runDump()
         if (!result.ok) {
             Log.w(TAG, "任务列表查询失败（本拍跳过）：${result.firstLine()}")
             return null
@@ -98,7 +112,7 @@ object TaskInspector {
      * 而不是把"没查到"误当成"没有卡片"。
      */
     fun listTasksOrNull(): List<TaskInfo>? {
-        val result = ShellRunner.exec("dumpsys activity activities", 15_000)
+        val result = runDump()
         if (!result.ok) {
             Log.w(TAG, "任务列表查询失败：${result.firstLine()}")
             return null
