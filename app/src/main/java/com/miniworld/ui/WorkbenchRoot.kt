@@ -66,6 +66,7 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
     var options by remember { mutableStateOf<List<PickOption>>(emptyList()) }
     var pickerOpen by remember { mutableStateOf(false) }
     var running by remember { mutableStateOf(false) }
+    var dropped by remember { mutableStateOf<List<String>>(emptyList()) }
     var overlayOk by remember { mutableStateOf(Settings.canDrawOverlays(activity)) }
     var notifyOk by remember { mutableStateOf(NotificationManagerCompat.from(activity).areNotificationsEnabled()) }
     // 自检面板：默认收起，点开才跑命令（里面有几条 shell 查询，不该每次进主页都跑）
@@ -88,7 +89,9 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
         while (true) {
             // 只有主界面在前台时才刷新，避免无谓的功耗；2 秒一次足够
             if (activity.hasWindowFocus()) {
-                running = WorkbenchService.controllerOrNull()?.currentState()?.running == true
+                val snapshot = WorkbenchService.controllerOrNull()?.currentState()
+                running = snapshot?.running == true
+                dropped = snapshot?.dropped ?: emptyList()
                 overlayOk = Settings.canDrawOverlays(activity)
                 notifyOk = NotificationManagerCompat.from(activity).areNotificationsEnabled()
             }
@@ -138,12 +141,20 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
         Text("当前挂机应用", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(currentLabel, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(4.dp))
+        // 掉线必须写出来：挂机的用法是"放着不管"，界面还写「运行中」等于骗人。
         Text(
-            if (running) "状态：运行中" else "状态：未运行",
+            when {
+                !running -> "状态：未运行"
+                dropped.isNotEmpty() -> "状态：已掉线 · ${dropped.joinToString("、")}"
+                else -> "状态：运行中"
+            },
             fontSize = 13.sp,
             fontWeight = FontWeight.Bold,
-            color = if (running) MaterialTheme.colorScheme.primary
-            else MaterialTheme.colorScheme.onSurfaceVariant
+            color = when {
+                !running -> MaterialTheme.colorScheme.onSurfaceVariant
+                dropped.isNotEmpty() -> MaterialTheme.colorScheme.error
+                else -> MaterialTheme.colorScheme.primary
+            }
         )
 
         Spacer(Modifier.height(24.dp))

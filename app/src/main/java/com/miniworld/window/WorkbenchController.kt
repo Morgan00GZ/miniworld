@@ -56,7 +56,14 @@ class WorkbenchController(context: Context) {
         /** 用户手动"浮出小窗"的那个包名；看门狗必须放过它，否则 6 秒后就被掰回小点。 */
         val manualOverlay: String? = null,
         val message: String = "未开工",
-        val log: List<String> = emptyList()
+        val log: List<String> = emptyList(),
+        /**
+         * 已经判定掉线、还没回来的应用（给人看的名字）。
+         *
+         * 界面拿它把「状态：运行中」改成「已掉线」，常驻通知也拿它写一行提醒 ——
+         * 挂机是"放着不管"的用法，掉线不吭声等于白挂。
+         */
+        val dropped: List<String> = emptyList()
     )
 
     private val appContext = context.applicationContext
@@ -195,8 +202,14 @@ class WorkbenchController(context: Context) {
         }
     }
 
-    /** 开工后启动看门狗：注册亮灭屏广播（幂等）+ 排第一拍。 */
-    private fun startWatchdog() {
+    /**
+     * 开工后启动看门狗：注册亮灭屏广播（幂等）+ 排第一拍。
+     *
+     * @param firstDelayMs 首拍延迟。开工补课刚跑完时要传 [TickPolicy.TICK_MS]：
+     *   补课已经把窗口摆好了，再空等 6 秒等于留一段没人管的空窗
+     *   （nrc 甩窗口正好发生在启动后 1~3 秒）。
+     */
+    private fun startWatchdog(firstDelayMs: Long = TickPolicy.START_DELAY_MS) {
         if (!screenReceiverRegistered) {
             val pm = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
             screenOn = pm?.isInteractive ?: true
@@ -216,10 +229,10 @@ class WorkbenchController(context: Context) {
         startGuard()
         scheduleAlarm()
         main.removeCallbacks(reconcileTick)
-        main.postDelayed(reconcileTick, TickPolicy.START_DELAY_MS)
+        main.postDelayed(reconcileTick, firstDelayMs)
         Diag.log(
             TAG,
-            "看门狗开拍：首拍延迟=${TickPolicy.START_DELAY_MS / 1000} s，" +
+            "看门狗开拍：首拍延迟=${firstDelayMs / 1000} s，" +
                 "亮屏节拍=${TickPolicy.TICK_MS / 1000} s，熄屏节拍=${TickPolicy.TICK_MS_SCREEN_OFF / 1000} s，" +
                 "闹钟兜底=${TickPolicy.ALARM_INTERVAL_MS / 60_000} 分钟"
         )
@@ -401,7 +414,12 @@ class WorkbenchController(context: Context) {
             // 用户手动浮出的那个小窗不要动，否则 6 秒后就被看门狗掰回小点
             if (window.packageName == current.manualOverlay) return@forEachIndexed
             val task = TaskInspector.find(window.packageName, window.userId, dump)
-                ?: return@forEachIndexed
+            if (task == null) {
+                // 任务不见了：以前这里静默跳过，界面照样写「运行中」，挂机掉了用户毫不知情。
+                noteMissing(window, dump)
+                return@forEachIndexed
+            }
+            notePresent(window)
             if (!task.isFreeform) return@forEachIndexed
             if (task.bounds != target) {
                 // 和弹出时一样走"先小后大"两步：单次 resize 在转屏之后经常不生效，
@@ -441,6 +459,89 @@ class WorkbenchController(context: Context) {
                 if (singleDot && task.visible) return@let
                 FreeformController.focusTask(task.taskId, main.component)
             }
+        }
+    }
+
+    // -------------------------------------------------- 掉线判定与自愈（条目 6）
+
+    /** 每个窗口连续几拍没找到任务。key = 包名#用户号。 */
+    private val missTicks = HashMap<String, Int>()
+
+    /** 每个窗口已经自动重开过几次。 */
+    private val relaunchTries = HashMap<String, Int>()
+
+    /** 当前「已掉线」的窗口：key -> 给人看的名字（界面和通知都读它）。 */
+    private val lostWindows = LinkedHashMap<String, String>()
+
+    private fun keyOf(window: LiveWindow) = "${window.packageName}#${window.userId}"
+
+    private fun labelOf(window: LiveWindow): String {
+        val slot = state.scene?.slots?.firstOrNull { it.index == window.slotIndex }
+        val name = slot?.label ?: window.packageName
+        return if (window.userId == 0) name else "$name（分身）"
+    }
+
+    /**
+     * 这一拍没找到任务：记账 → 够拍才认定掉线 → 必要时自动重开。
+     *
+     * 不能一拍就判：dump 偶尔会漏一两个任务，一秒内的误判既会让界面闪「已掉线」，
+     * 更糟的是触发重开。亮屏 2 s 一拍 → 3 拍约 6 s，够慢也够快。
+     */
+    private fun noteMissing(window: LiveWindow, dump: String) {
+        val key = keyOf(window)
+        val misses = (missTicks[key] ?: 0) + 1
+        missTicks[key] = misses
+        if (!DropPolicy.isLost(misses)) return
+        if (!lostWindows.containsKey(key)) {
+            lostWindows[key] = labelOf(window)
+            Diag.log(TAG, "掉线：${labelOf(window)}（连续 $misses 拍找不到任务）")
+            publishLost()
+        }
+        if (userIsBusyElsewhere(dump)) return
+        val tries = relaunchTries[key] ?: 0
+        if (!DropPolicy.mayRelaunch(misses, tries)) return
+        val component = window.component ?: return
+        relaunchTries[key] = tries + 1
+        Diag.log(TAG, "重开第 ${tries + 1} 次：${labelOf(window)}")
+        FreeformController.launchInFreeform(component, window.bounds, appContext)
+    }
+
+    /** 这一拍找到了：清掉记账；真的从「掉线」回来时还要通知界面。 */
+    private fun notePresent(window: LiveWindow) {
+        val key = keyOf(window)
+        missTicks.remove(key)
+        relaunchTries.remove(key)
+        if (lostWindows.remove(key) != null) {
+            Diag.log(TAG, "回来了：${labelOf(window)}")
+            publishLost()
+        }
+    }
+
+    /**
+     * 用户此刻是不是正在用**别人的全屏应用**？
+     *
+     * 是就不重开：挂机掉线可以等，把用户正在看的画面顶掉是更烦人的打扰。
+     * 桌面（com.miui.home）、我们自己、以及工作台里的应用都不算"别人"。
+     */
+    private fun userIsBusyElsewhere(dump: String): Boolean {
+        val pkg = TaskInspector.focusSnapshot(dump).focusedPackage ?: return false
+        if (pkg == appContext.packageName) return false
+        if (pkg == "com.miui.home") return false
+        return state.windows.none { it.packageName == pkg }
+    }
+
+    private fun publishLost() {
+        val snapshot = lostWindows.values.toList()
+        update { it.copy(dropped = snapshot) }
+    }
+
+    /** 收工/服务销毁时把掉线记账清干净，下次开工从零算。 */
+    private fun clearDropState() {
+        missTicks.clear()
+        relaunchTries.clear()
+        if (lostWindows.isNotEmpty()) {
+            lostWindows.clear()
+            update { it.copy(dropped = emptyList()) }
         }
     }
 
@@ -572,13 +673,18 @@ class WorkbenchController(context: Context) {
             // 旧版每 2.5~3 秒才看一次，根本追不上，用户看到的就是"窗口乱跳、前台不正常"。
             // 现在每 0.8 秒对所有槽位强制摆位一次，并把主窗（第一个槽位）重新置顶。
             var relaunched = 0
-            for (attempt in 0 until 12) {
-                Thread.sleep(800)
+            // 一轮只取**一份** dump：原来每轮按槽位各跑一次全量（单应用时一轮 2 份，
+            // 主窗还要再查一次），而这份文本真机上是 108 KB / 70 ms —— 补课期间它是唯一
+            // 在干活的东西，省下来最划算。
+            for (attempt in 0 until SettlePolicy.MAX_ROUNDS) {
+                Thread.sleep(SettlePolicy.ROUND_INTERVAL_MS)
+                val roundDump = TaskInspector.dumpOrNull() ?: continue
                 var drifted = 0
                 scene.slots.forEachIndexed { index, slot ->
                     val target = boundsList.getOrElse(index) { boundsList.last() }
                     val component = (slot.component ?: catalog.find(slot.packageName)?.component)?.let { if (slot.userId != 0) "$it@${slot.userId}" else it }
-                    val task = TaskInspector.find(slot.packageName, slot.userId) ?: return@forEachIndexed
+                    val task = TaskInspector.find(slot.packageName, slot.userId, roundDump)
+                        ?: return@forEachIndexed
                     if (task.bounds != target) {
                         FreeformController.resizeTask(task.taskId, target, verify = false)
                         drifted++
@@ -591,14 +697,17 @@ class WorkbenchController(context: Context) {
                 }
                 // 每轮都把主窗压回最上面——用户看到的必须是第一个 App，而不是某个保活小点
                 val mainSlot = scene.slots.first()
-                TaskInspector.find(mainSlot.packageName, mainSlot.userId)?.let { mainTask ->
+                TaskInspector.find(mainSlot.packageName, mainSlot.userId, roundDump)?.let { mainTask ->
                     FreeformController.focusTask(mainTask.taskId, mainSlot.component)
                 }
-                if (drifted == 0 && attempt >= 3) break
+                // 漂移清零后再看一轮就收工（原来是 >=3，等于平白多等 1.6 s）。
+                // 剩下的交给看门狗：它紧接着就会以 2 s 节拍接管。
+                if (SettlePolicy.shouldStop(attempt, drifted)) break
             }
-            // 校正完把最新任务号同步进 windows，Dock 的切换就靠它
-            scene.slots.forEachIndexed { index, slot ->
-                TaskInspector.find(slot.packageName, slot.userId)?.let { fresh ->
+            // 校正完把最新任务号同步进 windows，Dock 的切换就靠它（同样只读一份 dump）
+            val syncDump = TaskInspector.dumpOrNull()
+            if (syncDump != null) scene.slots.forEachIndexed { index, slot ->
+                TaskInspector.find(slot.packageName, slot.userId, syncDump)?.let { fresh ->
                     val live = LiveWindow(
                         slotIndex = index,
                         packageName = slot.packageName,
@@ -651,8 +760,9 @@ class WorkbenchController(context: Context) {
         // 保活是必需的，不提供开关：开工即把每个挂机应用加进白名单/活跃桶。
         applyKeepAlive(appTargets(windows, scene.slots), enable = true)
 
-        // 开工后启动窗口看门狗（把跑偏的自由窗口拉回格子；节拍见 TickPolicy）
-        startWatchdog()
+        // 开工后启动窗口看门狗（把跑偏的自由窗口拉回格子；节拍见 TickPolicy）。
+        // 首拍用常规节拍而不是 6 秒：补课刚把窗口摆好，再空等 6 秒就是一段没人管的空窗。
+        startWatchdog(TickPolicy.TICK_MS)
     }
 
     // ------------------------------------------------------------------ 切换
@@ -840,6 +950,7 @@ class WorkbenchController(context: Context) {
      */
     fun stop(killApps: Boolean = false, onFinished: (() -> Unit)? = null) = submit("收工") {
         try {
+            clearDropState()
             stopWatchdog("收工")
             val current = state
             val log = ArrayList<String>()

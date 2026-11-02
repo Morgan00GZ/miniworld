@@ -89,7 +89,10 @@ class WorkbenchService : Service(), DockView.Listener {
         store = SceneStore(this)
         windowManager = getSystemService(WindowManager::class.java)
         controller = WorkbenchController(this)
-        controller.addListener { state -> renderDock(state) }
+        controller.addListener { state ->
+            renderDock(state)
+            updateNotification(state)
+        }
 
         // 后台预热应用列表：Dock 一出现就要有图标，不能等它慢慢查
         Thread { runCatching { catalog.loadApps() } }.start()
@@ -313,7 +316,21 @@ class WorkbenchService : Service(), DockView.Listener {
         }
     }
 
-    private fun buildNotification(): Notification {
+    /**
+     * 常驻通知跟着运行状态走：掉线时把正文改成提醒。
+     *
+     * 用同一个通知 id 覆盖更新、不新建第二个通知 —— 用户拉开通知栏就能看到
+     * 「已掉线：洛克王国：世界（分身）（点启动重开）」，也不用额外维护生命周期。
+     */
+    private fun updateNotification(state: WorkbenchController.State) {
+        if (!state.running) return
+        val status = if (state.dropped.isEmpty()) null
+        else "已掉线：${state.dropped.joinToString("、")}（点启动重开）"
+        val manager = getSystemService(NotificationManager::class.java) ?: return
+        runCatching { manager.notify(NOTIFICATION_ID, buildNotification(status)) }
+    }
+
+    private fun buildNotification(status: String? = null): Notification {
         val contentIntent = PendingIntent.getActivity(
             this,
             0,
@@ -325,6 +342,7 @@ class WorkbenchService : Service(), DockView.Listener {
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(contentIntent)
             .setOngoing(true)
+            .apply { status?.let { setContentText(it) } }
             .build()
     }
 
