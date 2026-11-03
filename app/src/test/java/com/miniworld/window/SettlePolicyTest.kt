@@ -58,9 +58,24 @@ class SettlePolicyTest {
     }
 
     @Test
+    fun relaunch_waits_for_the_grace_period() {
+        // 真机事故：两次重开只隔 3.2 s，游戏还没起来就被第二次启动顶掉
+        assertFalse(DropPolicy.mayRelaunchNow(3, 1, sinceLastMs = 2_000L))
+        assertEquals(
+            false,
+            DropPolicy.mayRelaunchNow(4, 1, sinceLastMs = DropPolicy.RELAUNCH_GRACE_MS - 1)
+        )
+        assertTrue(DropPolicy.mayRelaunchNow(4, 1, sinceLastMs = DropPolicy.RELAUNCH_GRACE_MS))
+        assertTrue(DropPolicy.mayRelaunchNow(9, 1, sinceLastMs = 60_000L))
+        // 冷却期过了但次数已用尽，仍然不许再动
+        assertFalse(DropPolicy.mayRelaunchNow(9, 2, sinceLastMs = 60_000L))
+    }
+
+    @Test
     fun constants_stay_in_the_agreed_range() {
         assertEquals(800L, SettlePolicy.ROUND_INTERVAL_MS)
         assertEquals(3, DropPolicy.MISS_TICKS_TO_LOST)
         assertEquals(2, DropPolicy.MAX_RELAUNCH)
+        assertEquals(10_000L, DropPolicy.RELAUNCH_GRACE_MS)
     }
 }

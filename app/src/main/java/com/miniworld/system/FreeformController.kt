@@ -373,6 +373,16 @@ object FreeformController {
      * 顺序有讲究：任务 id 必须在 force-stop **之前**取（force-stop 会把任务从活动列表里清掉，
      * 之后就取不到了）；而 `am stack remove` 在 force-stop 之后照样有效（已实测）。
      */
+    /**
+     * 只结束进程，**不动**最近任务卡片（要连卡片一起摘用 [closePackage]）。
+     *
+     * 自动重开前先用它来一刀。真机踩过：任务被划走后进程往往还挂着（Activity 已销毁、
+     * 进程没死），这时再 `am start` 会落在一个"半死"的进程上——游戏起不来、也没有新任务，
+     * 日志里有「重开第 N 次」但界面一直停在「已掉线」。冷启动才稳。
+     */
+    fun forceStop(packageName: String, userId: Int): Boolean =
+        ShellRunner.exec("am force-stop --user $userId $packageName").ok
+
     fun closePackage(
         packageName: String,
         userId: Int,

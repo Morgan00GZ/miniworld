@@ -17,6 +17,7 @@ import com.miniworld.model.AppTarget
 import com.miniworld.model.LayoutPreset
 import com.miniworld.model.LiveWindow
 import com.miniworld.model.Scene
+import com.miniworld.model.Slot
 import com.miniworld.model.WorkbenchMode
 import com.miniworld.model.appTargets
 import com.miniworld.model.taskIdsOf
@@ -470,15 +471,37 @@ class WorkbenchController(context: Context) {
     /** 每个窗口已经自动重开过几次。 */
     private val relaunchTries = HashMap<String, Int>()
 
+    /** 每个窗口上次自动重开的时间点，用来做"重开冷却"（见 DropPolicy.RELAUNCH_GRACE_MS）。 */
+    private val lastRelaunchAt = HashMap<String, Long>()
+
     /** 当前「已掉线」的窗口：key -> 给人看的名字（界面和通知都读它）。 */
     private val lostWindows = LinkedHashMap<String, String>()
 
+    /** 已经记过一次「因为前景是别的应用而暂不重开」的窗口，避免每拍刷同一行日志。 */
+    private val suppressNoted = HashSet<String>()
+
     private fun keyOf(window: LiveWindow) = "${window.packageName}#${window.userId}"
+
+    /**
+     * 组件串补上「@用户号」。
+     *
+     * 分身（用户 999）那一份**只能靠这个后缀区分**：`FreeformController.amStart` 解析不到后缀时
+     * 会退回 `--user 0`，于是"重开 / 置顶"实际是把主系统那一份又拉了一遍。真机踩过——
+     * 日志写「重开结果：成功（…任务 74）」，可分身的游戏始终没起来，任务号还指回主系统那个。
+     */
+    private fun ensureUser(component: String?, userId: Int): String? =
+        component?.let { if (userId != 0 && !it.contains('@')) "$it@$userId" else it }
+
+    /** 槽位对应的启动组件串（带用户号）。 */
+    private fun resolveComponent(slot: Slot): String? =
+        ensureUser(slot.component ?: catalog.find(slot.packageName)?.component, slot.userId)
 
     private fun labelOf(window: LiveWindow): String {
         val slot = state.scene?.slots?.firstOrNull { it.index == window.slotIndex }
         val name = slot?.label ?: window.packageName
-        return if (window.userId == 0) name else "$name（分身）"
+        // 槽位名里本来就可能带「（分身）」（主界面显示的就是「洛克王国：世界（分身）」），
+        // 再无条件追加会变成「…（分身）（分身）」，所以只补一次。
+        return if (window.userId == 0 || name.contains("（分身）")) name else "$name（分身）"
     }
 
     /**
@@ -497,13 +520,42 @@ class WorkbenchController(context: Context) {
             Diag.log(TAG, "掉线：${labelOf(window)}（连续 $misses 拍找不到任务）")
             publishLost()
         }
-        if (userIsBusyElsewhere(dump)) return
+        if (userIsBusyElsewhere(dump)) {
+            // 每 2 s 一拍，这里不能每拍都刷一行日志；同一次掉线只记一次就够了。
+            if (suppressNoted.add(key)) {
+                Diag.log(TAG, "暂不重开：${labelOf(window)}（前景是别的应用，先不抢回来）")
+            }
+            return
+        }
         val tries = relaunchTries[key] ?: 0
-        if (!DropPolicy.mayRelaunch(misses, tries)) return
+        val sinceLast = System.currentTimeMillis() - (lastRelaunchAt[key] ?: 0L)
+        if (!DropPolicy.mayRelaunchNow(misses, tries, sinceLast)) return
         val component = window.component ?: return
         relaunchTries[key] = tries + 1
-        Diag.log(TAG, "重开第 ${tries + 1} 次：${labelOf(window)}")
-        FreeformController.launchInFreeform(component, window.bounds, appContext)
+        lastRelaunchAt[key] = System.currentTimeMillis()
+        Diag.log(TAG, "重开第 ${tries + 1} 次：${labelOf(window)}（组件 ${component}）")
+        // 先结束残进程再冷启动：任务没了但进程还活着时，"am start" 会起不来（见 forceStop 注释）
+        FreeformController.forceStop(window.packageName, window.userId)
+        // force-stop 是异步的：紧接着就 am start 会撞上"正在停止"，启动被系统直接丢掉
+        // （真机对比：手动隔 2 秒再 start 一次就成功，程序里连着发则起不来）。
+        Thread.sleep(1_500)
+        // 重开时**不能**直接给小点坐标：真机上这么干，游戏起来就没有任务了（启动阶段
+        // 窗口整块在屏外，ROM 会把 Activity 收掉）。正常开工是先给一个屏上的正常窗口、
+        // 再由看门狗"缩"成小点——缩可以、从出生就在屏外不行，所以这里也照那样来。
+        val outcome = FreeformController.launchInFreeform(
+            component = component,
+            bounds = overlayBounds(),
+            context = appContext,
+            preferredStrategy = store.workingStrategy()
+        )
+        Diag.log(
+            TAG,
+            "重开结果：${if (outcome.success) "成功" else "失败"}" +
+                "（策略 ${outcome.strategy}${if (outcome.task != null) "，任务 ${outcome.task.taskId}" else ""}）"
+        )
+        // 把启动过程逐行落盘：分身（--user 999）这条路上出过"报成功但游戏没起来"，
+        // 只有看到真正执行的那条 am start 才能判断是命令没带用户号、还是系统把启动丢了。
+        outcome.log.forEach { Diag.log(TAG, "    $it") }
     }
 
     /** 这一拍找到了：清掉记账；真的从「掉线」回来时还要通知界面。 */
@@ -511,6 +563,8 @@ class WorkbenchController(context: Context) {
         val key = keyOf(window)
         missTicks.remove(key)
         relaunchTries.remove(key)
+        lastRelaunchAt.remove(key)
+        suppressNoted.remove(key)
         if (lostWindows.remove(key) != null) {
             Diag.log(TAG, "回来了：${labelOf(window)}")
             publishLost()
@@ -539,6 +593,8 @@ class WorkbenchController(context: Context) {
     private fun clearDropState() {
         missTicks.clear()
         relaunchTries.clear()
+        lastRelaunchAt.clear()
+        suppressNoted.clear()
         if (lostWindows.isNotEmpty()) {
             lostWindows.clear()
             update { it.copy(dropped = emptyList()) }
@@ -606,7 +662,7 @@ class WorkbenchController(context: Context) {
 
         if (mode == WorkbenchMode.FREEFORM_TILING) {
             scene.slots.forEachIndexed { index, slot ->
-                val component = (slot.component ?: catalog.find(slot.packageName)?.component)?.let { if (slot.userId != 0) "$it@${slot.userId}" else it }
+                val component = resolveComponent(slot)
                 if (component == null) {
                     log += "× ${slot.label}：找不到可启动组件"
                     return@forEachIndexed
@@ -638,7 +694,7 @@ class WorkbenchController(context: Context) {
         } else {
             // 非平铺档位：不追求栅格，只保证"拉得起来 + 不被冻结 + 能一键切回"
             scene.slots.forEachIndexed { index, slot ->
-                val component = (slot.component ?: catalog.find(slot.packageName)?.component)?.let { if (slot.userId != 0) "$it@${slot.userId}" else it }
+                val component = resolveComponent(slot)
                 if (component == null) {
                     log += "× ${slot.label}：找不到可启动组件"
                     return@forEachIndexed
@@ -682,7 +738,7 @@ class WorkbenchController(context: Context) {
                 var drifted = 0
                 scene.slots.forEachIndexed { index, slot ->
                     val target = boundsList.getOrElse(index) { boundsList.last() }
-                    val component = (slot.component ?: catalog.find(slot.packageName)?.component)?.let { if (slot.userId != 0) "$it@${slot.userId}" else it }
+                    val component = resolveComponent(slot)
                     val task = TaskInspector.find(slot.packageName, slot.userId, roundDump)
                         ?: return@forEachIndexed
                     if (task.bounds != target) {
@@ -712,7 +768,9 @@ class WorkbenchController(context: Context) {
                         slotIndex = index,
                         packageName = slot.packageName,
                         userId = slot.userId,
-                        component = slot.component ?: catalog.find(slot.packageName)?.component,
+                        // 必须走 resolveComponent：这里原来直接存裸组件串，于是补课同步之后
+                        // 记录里的组件丢了「@999」，后面重开/置顶全落到主系统那一份上。
+                        component = resolveComponent(slot),
                         taskId = fresh.taskId,
                         bounds = fresh.bounds ?: boundsList.getOrElse(index) { boundsList.last() },
                         launchedBy = "settled"
@@ -737,7 +795,7 @@ class WorkbenchController(context: Context) {
         // 游戏在后台只出声音（真机 m01875："能听到声音，但是显示不正常"）。
         // 对"不在自由窗口里"的主位，直接普通启动一次，系统保证它到前台。
                 windows.minByOrNull { it.slotIndex }?.let { main ->
-            val mainComponent = main.component ?: catalog.find(main.packageName)?.component
+            val mainComponent = ensureUser(main.component ?: catalog.find(main.packageName)?.component, main.userId)
             val mainTask = TaskInspector.find(main.packageName, main.userId)
             if (mainComponent != null && (mainTask == null || !mainTask.isFreeform)) {
                 FreeformController.launchPlain(mainComponent)
@@ -836,10 +894,7 @@ class WorkbenchController(context: Context) {
         if (after == null || afterW != (next.right - next.left)) {
             // 必须带上 "@用户号"：不带的话启动有分身的应用会弹"选哪一个"的系统选择框
             //（真机 m01948："全屏之后再次点击图标，会让我选择启动哪个 nrc"）。
-            val rawComp = target.component ?: catalog.find(target.packageName)?.component
-            val comp = rawComp?.let {
-                if (slotUserId != 0 && !it.contains('@')) "$it@$slotUserId" else it
-            }
+            val comp = ensureUser(target.component ?: catalog.find(target.packageName)?.component, slotUserId)
             if (comp != null) {
                 FreeformController.launchInFreeform(comp, next, appContext)
                 Diag.log(TAG, "切换：${target.packageName} resize 未生效，已重新拉起一次")

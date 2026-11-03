@@ -45,7 +45,24 @@ internal object DropPolicy {
     /** 最多自动重开几次；超过就交给用户（界面与常驻通知会一直挂着「已掉线」）。 */
     const val MAX_RELAUNCH = 2
 
+    /**
+     * 重开一次之后要**等多久**才允许再重开。
+     *
+     * 真机踩过：任务被抹掉后第 1 次重开和第 2 次重开只隔 3.2 秒（2 拍），
+     * 而 UE4 的游戏要十几秒才真正起来——两次启动互相打架，最后两个都没活下来。
+     * 10 秒是"够它把进程和窗口建起来"的下限，比它短就会重复踢同一个球。
+     */
+    const val RELAUNCH_GRACE_MS = 10_000L
+
     fun isLost(misses: Int): Boolean = misses >= MISS_TICKS_TO_LOST
 
     fun mayRelaunch(misses: Int, tries: Int): Boolean = isLost(misses) && tries < MAX_RELAUNCH
+
+    /**
+     * 这次真的能动手了吗：既要在次数上限内，也要离上次重开够久。
+     *
+     * @param sinceLastMs 距离上次重开过了多少毫秒；从没重开过传 [RELAUNCH_GRACE_MS] 以上。
+     */
+    fun mayRelaunchNow(misses: Int, tries: Int, sinceLastMs: Long): Boolean =
+        mayRelaunch(misses, tries) && sinceLastMs >= RELAUNCH_GRACE_MS
 }
