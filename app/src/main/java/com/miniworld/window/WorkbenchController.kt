@@ -900,6 +900,8 @@ class WorkbenchController(context: Context) {
                 Diag.log(TAG, "切换：${target.packageName} resize 未生效，已重新拉起一次")
             }
         }
+        // 刚动过窗口 → 接下来 10 s 用快档盯着落位（1.2 起空闲档是 5 s，不能等它慢慢发现）
+        fastUntil = System.currentTimeMillis() + TickPolicy.FAST_HOLD_MS
         update {
             it.copy(
                 manualOverlay = if (isDot) target.packageName else null,
@@ -926,6 +928,7 @@ class WorkbenchController(context: Context) {
                 FreeformController.resizeTask(task.taskId, dotBounds(), verify = false)
             }
         }
+        fastUntil = System.currentTimeMillis() + TickPolicy.FAST_HOLD_MS
         update { it.copy(manualOverlay = null, message = "已收起浮窗") }
     }
 

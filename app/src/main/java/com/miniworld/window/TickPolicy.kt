@@ -15,6 +15,16 @@ object TickPolicy {
     /** 亮屏节拍：与 1.11 完全一致 —— 亮屏时用户看到的行为一点都没变。 */
     const val TICK_MS = 2_000L
 
+    /**
+     * 亮屏但**没在动窗口**时的节拍：5 s 一拍（1.2 起）。
+     *
+     * 2 s 那一档原本是为了"刚开工那十几秒窗口在系统手里乱跳"；稳定挂机时其实用不上，
+     * 而每拍都要过一份 108 KB 的 `dumpsys`（实测 70 ms + 一个 `sh` 进程），
+     * 亮屏 2 s 一拍相当于每分钟经手 3.2 MB 文本。所以：刚动过窗口/焦点 → 2 s（`FAST_HOLD_MS` 内），
+     * 稳定之后 → 5 s。代价是"任务被划掉"这类事件的发现延迟从约 6 s 变成最多约 15 s（3 拍），可接受。
+     */
+    const val TICK_MS_IDLE = 5_000L
+
     /** 熄屏节拍：20 s 一拍（兜底最长也就晚 20 s 补上）。 */
     const val TICK_MS_SCREEN_OFF = 20_000L
 
@@ -42,12 +52,15 @@ object TickPolicy {
 
     /**
      * 下一拍该等多久：
-     *  - `fastUntil` 还没到 → 快档（刚动过窗口，要盯着它落位）；
-     *  - 亮屏 → 快档（用户可能正看着，行为与 1.11 一致）；
-     *  - 熄屏且没有刚动过 → 慢档 20 s。
+     *  - `fastUntil` 还没到 → 快档 2 s（刚动过窗口，要盯着它落位）；
+     *  - 熄屏且没在动 → 慢档 20 s（用户根本不看屏幕）；
+     *  - 亮屏且没在动 → 空闲档 5 s（1.2 起；稳定挂机不需要 2 s 的精度）。
      */
-    fun intervalMs(screenOn: Boolean, fastUntil: Long, now: Long): Long =
-        if (!screenOn && now >= fastUntil) TICK_MS_SCREEN_OFF else TICK_MS
+    fun intervalMs(screenOn: Boolean, fastUntil: Long, now: Long): Long {
+        val fast = now < fastUntil
+        if (!screenOn) return if (fast) TICK_MS else TICK_MS_SCREEN_OFF
+        return if (fast) TICK_MS else TICK_MS_IDLE
+    }
 
     /**
      * 漏拍判据：超过"两拍 + 5 秒"还没跳，就认为节拍链断了、或者被系统压住了。

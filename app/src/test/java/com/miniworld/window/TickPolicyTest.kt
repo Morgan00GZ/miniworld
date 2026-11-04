@@ -3,15 +3,21 @@ package com.miniworld.window
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
-/** 看门狗节拍档位（1.12）：熄屏 20 s、亮屏 2 s、刚动过窗口保持 10 s 快档。 */
+/** 看门狗节拍档位：熄屏 20 s、亮屏空闲 5 s、刚动过窗口 2 s（保持 10 s）。 */
 class TickPolicyTest {
 
     @Test
-    fun 亮屏永远是快档() {
-        assertEquals(2_000L, TickPolicy.intervalMs(screenOn = true, fastUntil = 0L, now = 1_000L))
+    fun 亮屏空闲时降到五秒档() {
+        // 1.2 起：亮屏不再固定 2 s —— 快档保持过期后降到 5 s
+        assertEquals(5_000L, TickPolicy.intervalMs(screenOn = true, fastUntil = 0L, now = 1_000L))
+        assertEquals(5_000L, TickPolicy.intervalMs(screenOn = true, fastUntil = 1L, now = 9_999_999L))
+    }
+
+    @Test
+    fun 刚动过窗口时亮屏仍是快档() {
         assertEquals(2_000L, TickPolicy.intervalMs(screenOn = true, fastUntil = 99_000L, now = 1_000L))
-        // 快档保持已过期也一样：亮屏就是 2 s
-        assertEquals(2_000L, TickPolicy.intervalMs(screenOn = true, fastUntil = 1L, now = 9_999_999L))
+        // 刚好到点 → 回空闲档
+        assertEquals(5_000L, TickPolicy.intervalMs(screenOn = true, fastUntil = 1_000L, now = 1_000L))
     }
 
     @Test
@@ -30,9 +36,12 @@ class TickPolicyTest {
     }
 
     @Test
-    fun 两个档位就是用户选的那两个数() {
+    fun 三个档位就是用户选的那三个数() {
         assertEquals(2_000L, TickPolicy.TICK_MS)
+        assertEquals(5_000L, TickPolicy.TICK_MS_IDLE)
         assertEquals(20_000L, TickPolicy.TICK_MS_SCREEN_OFF)
+        // 快档保持必须够长：两步 resize 的第二步要等 200 ms 落位，10 s 足够覆盖
+        assertEquals(10_000L, TickPolicy.FAST_HOLD_MS)
     }
 
     @Test

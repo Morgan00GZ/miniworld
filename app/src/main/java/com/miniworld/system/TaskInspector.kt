@@ -215,7 +215,11 @@ object TaskInspector {
         if (result.isEmpty()) {
             Log.w(TAG, "dumpsys 解析出 0 个任务，可能是 ROM 排版差异；原始长度=${dump.length}")
         }
-        return result
+        // 同一份 dump 里，同一个任务会被再次列出来（"Task display area" 段会把根任务再摘一遍，
+        // 真机夹具 activities-keepalive.txt 里 #88 就出现两次）。重复项没有 mBounds，
+        // 一旦被当成独立任务，任何按数量做的判断都会错位。按 taskId 去重，保留**第一次出现**
+        //（那一条是带 mBounds / topResumedActivity 的完整块）。
+        return result.distinctBy { it.taskId }
     }
 
     /**
