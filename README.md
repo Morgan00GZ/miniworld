@@ -79,9 +79,9 @@
 |---|---|---|---|
 | 隐形小点位置 | 真实屏幕右下再外移 `+16 / +34` px | `app/.../window/WorkbenchController.kt:775`（`DOT_OUT_X/Y` 在 `:896-897`） | 让**小点 + 系统给自由窗口画的装饰**一起落到屏幕外；留 16/34 px 余量，装饰才不外露 |
 | 小点尺寸 | 2×2 px | 同上 | 只要窗口「可见」即可保活，占用越小越好 |
-| 看门狗节拍 | 亮屏 2 s / 熄屏 20 s | `app/.../window/TickPolicy.kt:16,19` | 每拍要起一个 `sh` 跑一条 `dumpsys`（实测 ~0.01 s、72 KB）；熄屏时用户不看屏幕，降到 20 s；熄屏兜底最长也就晚 20 s |
+| 看门狗节拍 | 亮屏 2 s / 熄屏 20 s | `app/.../window/TickPolicy.kt:16,19` | 每拍要起一个 `sh` 跑一条 `dumpsys`（实测约 70 ms、108 KB）；熄屏时用户不看屏幕，降到 20 s；熄屏兜底最长也就晚 20 s |
 | 动过窗口后的快档保持 | 10 s | `TickPolicy.kt:26` | `resize` 在本机要「先小后大」两步才落位，确认必须跟得上 |
-| 开工首拍延迟 | 6 s | `TickPolicy.kt:29` | 给系统把窗口拉起来的时间 |
+| 开工首拍延迟 | 2 s（1.2 起；更早是 6 s） | `TickPolicy.kt:29` | 启动后的收拾工作交给补课循环，看门狗不必再干等；真机开工 5.34 → 3.31 s |
 | 心跳日志间隔 | 5 min（按时间算，不按拍数） | `TickPolicy.kt:32` | 两种节拍下都是 5 分钟一条，日志好读 |
 | 漏拍判据 | `两拍 + 5 s` | `TickPolicy.kt:58` | 真机复现过**整进程被挂起 13.5 分钟**，需要一条能自证的判据 |
 | 闹钟兜底 | 10 min | `TickPolicy.kt:41` | 进程内巡检线程会跟进程一起被冻住，只能靠系统闹钟从外部唤醒 |
@@ -89,6 +89,10 @@
 | 浮窗尺寸 | 可用宽的 3/4，16:9，居中 | `WorkbenchController.kt:788`（`overlayBounds`） | 横屏游戏是 16:9，窗口同比例画面才铺满、触控映射才对 |
 | Dock 宽度 / 图标 | 48dp / 40dp，空闲 4 s 淡化到 `alpha=0.35`，200 ms 动画 | `app/.../service/DockView.kt:52-61,263` | 这台机器只有 375dp 宽，早先 70dp 的 Dock 会吃掉右边 1/5 |
 | 系统栏内缩兜底 | 状态栏 26dp / 导航栏 16dp | `app/.../system/ScreenMetrics.kt:61-62` | 服务在后台取不到窗口上下文，只能用系统资源 + 兜底值 |
+| 开工补课 | 每轮间隔 800 ms、最多 12 轮；**漂移清零后再确认一轮**就收工 | `app/.../window/SettlePolicy.kt` | 窗口刚起来时会乱跳，固定空等 3 轮纯属浪费；真机开工 5.34 → 3.31 s |
+| 掉线判定 | 连续 **3 拍**（约 6 s）找不到任务才算 | `SettlePolicy.kt` 的 `DropPolicy.MISS_TICKS_TO_LOST` | 单拍读不到只当抖动——一次 `dumpsys` 失败不能当成"挂机没了"去动窗口 |
+| 自动重开 | 最多 2 次，两次间隔 ≥10 s，先 `force-stop` 再等 1.5 s | `DropPolicy.MAX_RELAUNCH` / `RELAUNCH_GRACE_MS` | UE4 游戏起得慢，3 秒就重开会被自己顶掉；任务没了但进程还挂着时 `am start` 起不来 |
+| 自检采样窗口 | 最近 20 次（只存内存） | `app/.../system/Metrics.kt` | 只为了给 P50/P95 一个样本量，不落盘、不上报 |
 
 ### 5.2 关键代码段
 
@@ -152,8 +156,10 @@ ShellRunner.exec("am stack remove $id")                        // 摘掉后台�
 ### 5.3 其他被真机逼出来的实现细节
 
 - **落盘日志 `diag.log`**（`system/Diag.kt`）：这台机器把 logcat 的 main 缓冲区抽干了，读不到任何应用日志，所以关键事件自己写到 `Android/data/com.miniworld/files/diag.log`；1.12 起只记「失败 + 每 5 分钟一条心跳」。
-- **`resize` 按需复查**（`FreeformController.kt:275`，`verify` 参数）：只看退出码会被 ROM 骗过去，所以要回读 `dumpsys` 的矩形比对（容差 24 px）。但这次回读本身又是一份约 72 KB 的 `dumpsys`，所以只有「结论要参与决策」的调用方才复查；纯摆位的调用方传 `verify = false`，交给下一拍统一判定。
-- **主页「自检 ▸」**（`system/SelfCheck.kt` + `system/Metrics.kt`）：默认收起，点开才跑几条只读命令，显示 Shizuku uid / 当前用户（分身 999）/ 保活四项 / 冻结器 / 自由窗口开关 / 每拍 `dumpsys` 的大小与耗时 / 本次运行的 dump 与校正次数。排障不必再连电脑读 `diag.log`。
+- **`resize` 按需复查**（`FreeformController.kt:275`，`verify` 参数）：只看退出码会被 ROM 骗过去，所以要回读 `dumpsys` 的矩形比对（容差 24 px）。但这次回读本身又是一份约 108 KB 的 `dumpsys`，所以只有「结论要参与决策」的调用方才复查；纯摆位的调用方传 `verify = false`，交给下一拍统一判定。
+- **主页「自检 ▸」**（`system/SelfCheck.kt` + `system/Metrics.kt`）：默认收起，点开在后台线程跑几条只读命令，出一屏 9 行短句——Shizuku / shell 用户 / 挂机用户（分身时标「小米手机分身」）/ 保活白名单 / 后台运行 / 待机桶 / 冻结器 · 自由窗口 / 每拍 `dumpsys` 的大小与耗时 / 校正次数；标题带采集时刻，点启动或关闭后自动重采（否则会显示启动前的旧值，看着像"没生效"）。排障不必再连电脑读 `diag.log`。`dumpsys` 那条原始输出带 `time=+77d15h47m41s188ms ago` 这类超长尾巴，会折行把后面几行顶出屏幕，所以先翻译成短值再显示。
+- **分身场景下组件串要连用户号一起存**（`WorkbenchController.ensureUser`）：`FreeformController` 是按组件串尾部的 `@999` 推 `--user` 的，推不出来**默认 0**。凡是从任务列表重建出来的启动目标都要补齐后缀，否则会安静地去操作主系统那一份，日志还写「重开成功」。
+- **「任务不见了」要连续多拍才成立**（`window/SettlePolicy.kt`）：单拍读不到只当抖动、整拍跳过；连续 3 拍才判掉线，然后界面、通知、日志三处提示，并自动重开（最多 2 次、间隔 ≥10 秒、先 `force-stop` 再等 1.5 秒冷启动）。前景既不是桌面也不是自己时**不抢画面**——用户正在看别的 App，抢回来只会打断他。
 - **保活命令合并成一条**（`system/KeepAlive.kt` 的 `applyBatch`）：5 条命令用 `;` 拼成一条 `sh` 脚本，每条挂 `|| echo __FAIL__:key`，靠标记还原每一步的成败——语义不变，但从 5 个 `sh` 进程变成 1 个。
 - **地址串不能带逗号**：`am task resize` 要 4 个空格分隔的数字，逗号串必抛 `NumberFormatException`。
 - **焦点交还只发一条命令**（`WorkbenchController.kt:129`）：窗口被系统顶成 `topDisplayFocusedRootTask` 时，只对「用户此刻真正在看的那个任务」发一条 `am task focus`，**不动任何几何**；单应用小点模式下如果窗口在系统眼里仍可见，一拍都不抢前台——否则手势导航的侧滑返回会被 2×2 小点吃掉。
