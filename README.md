@@ -262,10 +262,10 @@ app/src/main/java/com/miniworld/
     ├── LayoutEngine.kt             # 纯函数布局
     └── TickPolicy.kt               # 纯函数节拍策略
 
-app/src/test/…                      # 29 个 JVM 单测
+app/src/test/…                      # 76 个 JVM 单测（含真机 dump 夹具）
 docs/                               # 项目文档 / 开发文档 / 版本记录 / 真机验证清单
-snapshots/                          # 每个版本的快照（含 APK）
-tools/                              # 构建、探测、验证、发布脚本
+snapshots/                          # 本地快照（含 APK）——**gitignore，不随仓库发布**
+tools/                              # 构建、探测、验证、发布脚本——**gitignore，不随仓库发布**
 ```
 
 ## 10. 开发 / 验证工具
@@ -286,9 +286,11 @@ tools/                              # 构建、探测、验证、发布脚本
 
 ## 11. 版本与快照
 
-每个可用的版本都在 `snapshots/<版本>-<一句话>/` 下留了一份完整快照（源码 + `须弥芥子-<版本>.apk`），并打了同名 git tag。详细改动见 [docs/版本记录.md](docs/版本记录.md)。
+每个可用的版本都在本地 `snapshots/<版本>-<一句话>/` 下留了一份完整快照（源码 + `须弥芥子-<版本>.apk`），并打了同名 git tag。详细改动见 [docs/版本记录.md](docs/版本记录.md)。
 
-| 版本 | 一句话 | 快照目录 |
+> **仓库里不含 `snapshots/` 和 `tools/`**：快照每个版本 20 MB 上下、纯冗余，脚本属于作者的个人工作流，两者都在 `.gitignore` 里，只留在作者本机。想要某个版本的源码，`git checkout <tag>` 即可；想要装 APK，去 Releases 页面下。
+
+| 版本 | 一句话 | 快照目录（本地） |
 |---|---|---|
 | 1.0 | 首个可用正式版 | `snapshots/1.0-正式版` |
 | 1.01 | 项目改名为 miniworld | `snapshots/1.01-改名版` |
