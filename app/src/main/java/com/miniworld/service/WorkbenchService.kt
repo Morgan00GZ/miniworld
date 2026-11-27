@@ -24,6 +24,8 @@ import com.miniworld.R
 import com.miniworld.apps.AppCatalog
 import com.miniworld.data.SceneStore
 import com.miniworld.model.WorkbenchMode
+import com.miniworld.pocket.PocketClient
+import com.miniworld.system.Diag
 import com.miniworld.system.KeepAlive
 import com.miniworld.window.WorkbenchController
 
@@ -81,6 +83,9 @@ class WorkbenchService : Service(), DockView.Listener {
     private var dockView: DockView? = null
     private var dockParams: WindowManager.LayoutParams? = null
 
+    /** 倒置熄屏状态回调。PocketClient 是单例，onDestroy 必须摘掉，否则反复开工会一直累积。 */
+    private var pocketListener: ((PocketClient.State) -> Unit)? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -93,6 +98,16 @@ class WorkbenchService : Service(), DockView.Listener {
             renderDock(state)
             updateNotification(state)
         }
+        // 倒置熄屏的真状态也来自外部（Shizuku 可能掉线），统一在这里回灌给编排器。
+        PocketClient.init(this)
+        val pocketListener: (PocketClient.State) -> Unit = { pocket ->
+            controller.setPocketArmed(pocket.armed)
+            val state = controller.currentState()
+            renderDock(state)
+            updateNotification(state)
+        }
+        this.pocketListener = pocketListener
+        PocketClient.addListener(pocketListener)
 
         // 后台预热应用列表：Dock 一出现就要有图标，不能等它慢慢查
         Thread { runCatching { catalog.loadApps() } }.start()
@@ -124,9 +139,21 @@ class WorkbenchService : Service(), DockView.Listener {
                 // "用户手动覆盖的档位"，那两个键是自检页时代的产物；老设备上残留一个
                 // mode_override=QUICK_SWITCH 就会让 App 走"不缩成小点、不隐形"那条死路。
                 controller.startScene(scene, WorkbenchMode.FREEFORM_TILING)
+                // 「倒置熄屏」是记住的状态：上次开着，这次开工就自动把锁拿回来。
+                // 锁只在开工期间有意义，所以收工时放掉、不跟着 App 常驻。
+                if (store.invertScreenOff()) {
+                    PocketClient.setArmed(true) { ok, message ->
+                        if (!ok) {
+                            Diag.log(TAG, "倒置熄屏自动开启失败：$message")
+                            toast(message)
+                        }
+                    }
+                }
             }
 
             ACTION_STOP -> {
+                // 收工顺手放掉熄屏锁：留着它屏幕会一直不亮，用户会以为手机坏了。
+                PocketClient.releaseQuietly()
                 // Dock 立刻消失（用户看到的反馈不变），但服务等收工**跑完**再停：
                 // 以前这里立刻 stopSelf()，onDestroy 里的 shutdownNow() 会打断工作线程，
                 // 收工第一条 dumpsys 直接 InterruptedException，后台卡片摘不掉（真机事故 2026-10-13）。
@@ -168,6 +195,9 @@ class WorkbenchService : Service(), DockView.Listener {
 
     override fun onDestroy() {
         teardownDock()
+        pocketListener?.let { PocketClient.removeListener(it) }
+        pocketListener = null
+        PocketClient.releaseQuietly()
         runCatching { controller.shutdown() }
         instance = null
         super.onDestroy()
@@ -324,8 +354,11 @@ class WorkbenchService : Service(), DockView.Listener {
      */
     private fun updateNotification(state: WorkbenchController.State) {
         if (!state.running) return
-        val status = if (state.dropped.isEmpty()) null
-        else "已掉线：${state.dropped.joinToString("、")}（点启动重开）"
+        val status = when {
+            state.dropped.isNotEmpty() -> "已掉线：${state.dropped.joinToString("、")}（点启动重开）"
+            state.pocketArmed -> "倒置熄屏中：屏幕朝下熄屏也不停，拿起自动亮屏"
+            else -> null
+        }
         val manager = getSystemService(NotificationManager::class.java) ?: return
         runCatching { manager.notify(NOTIFICATION_ID, buildNotification(status)) }
     }

@@ -12,8 +12,8 @@ android {
         applicationId = "com.miniworld"
         minSdk = 30
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.3"
+        versionCode = 10
+        versionName = "1.4"
     }
 
     buildTypes {
@@ -37,6 +37,9 @@ android {
 
     buildFeatures {
         compose = true
+        // 「倒置熄屏」用 AIDL 跟 Shizuku 的 UserService 通信（IPocketService.aidl），
+        // AGP 8 默认关掉了 aidl，不打开这个开关生成不出 Stub。
+        aidl = true
     }
 
     packaging {

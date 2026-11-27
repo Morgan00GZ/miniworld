@@ -72,6 +72,18 @@ class SceneStore(context: Context) {
      * 记住"上次哪条启动策略成功了"。
      * 下次直接用它，省掉盲试带来的黑屏闪烁。
      */
+    /**
+     * 「倒置熄屏」上次是不是开着的。
+     *
+     * 只记「用户想要」，不记「锁现在在不在」：锁活在 Shizuku 的 UserService 进程里，
+     * 进程一没锁就没了，把它当成持久状态显示就是骗人。开工时按这个值自动再拿一次。
+     */
+    fun invertScreenOff(): Boolean = prefs.getBoolean(KEY_INVERT, false)
+
+    fun setInvertScreenOff(on: Boolean) {
+        prefs.edit().putBoolean(KEY_INVERT, on).apply()
+    }
+
     fun workingStrategy(): String? = prefs.getString(KEY_STRATEGY, null)
 
     fun setWorkingStrategy(strategy: String?) {
@@ -127,5 +139,6 @@ class SceneStore(context: Context) {
         const val KEY_SCENES = "scenes"
         const val KEY_ACTIVE = "active_scene"
         const val KEY_STRATEGY = "working_strategy"
+        const val KEY_INVERT = "invert_screen_off"
     }
 }

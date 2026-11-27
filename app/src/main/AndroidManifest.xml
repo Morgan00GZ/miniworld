@@ -52,6 +52,14 @@
                 android:value="保持多窗口工作台的悬浮 Dock 与窗口编排常驻" />
         </service>
 
+        <!--
+            倒置熄屏：跑在 Shizuku 的 UserService 进程里（shell, uid=2000）。
+            exported=false —— 只有 Shizuku 会把它拉起来，别的应用不该能触发熄屏锁。
+        -->
+        <service
+            android:name=".pocket.PocketService"
+            android:exported="false" />
+
         <receiver
             android:name=".service.BootReceiver"
             android:enabled="true"

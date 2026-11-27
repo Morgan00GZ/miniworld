@@ -6,10 +6,11 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.hardware.display.DisplayManager
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
 import android.util.Log
+import android.view.Display
 import androidx.core.content.ContextCompat
 import com.miniworld.apps.AppCatalog
 import com.miniworld.data.SceneStore
@@ -59,6 +60,13 @@ class WorkbenchController(context: Context) {
         val message: String = "未开工",
         val log: List<String> = emptyList(),
         /**
+         * 「倒置熄屏」是否武装中（Shizuku 已拿到接近传感器关屏锁）。
+         *
+         * 只影响掉线判定和 Dock 按钮的底色；没开启时这里恒为 false，
+         * 所有原有节拍、判定、功耗行为跟不带这个功能时完全一致。
+         */
+        val pocketArmed: Boolean = false,
+        /**
          * 已经判定掉线、还没回来的应用（给人看的名字）。
          *
          * 界面拿它把「状态：运行中」改成「已掉线」，常驻通知也拿它写一行提醒 ——
@@ -88,6 +96,12 @@ class WorkbenchController(context: Context) {
     }
 
     fun currentState(): State = state
+
+    /** 倒置熄屏的真状态由 WorkbenchService 同步进来（Shizuku 掉线时会被改回 false）。 */
+    fun setPocketArmed(armed: Boolean) {
+        if (state.pocketArmed == armed) return
+        update { it.copy(pocketArmed = armed) }
+    }
 
     private fun update(transform: (State) -> State) {
         val next = transform(state)
@@ -188,18 +202,49 @@ class WorkbenchController(context: Context) {
     private var watchdogGuard: ScheduledExecutorService? = null
 
     /**
+     * 屏幕此刻是不是真的亮着。
+     *
+     * 为什么不能用 `PowerManager.isInteractive`：倒置熄屏用 shell 身份持着
+     * `PROXIMITY_SCREEN_OFF_WAKE_LOCK`，屏幕**物理熄灭**（Display State=OFF）时
+     * `isInteractive` 依然是 true（真机 2026-11-26 实测）。拿它当判据，熄屏后
+     * 既不会降频、也不会暂停掉线判定。屏的真实状态只有 DisplayManager 知道。
+     */
+    private fun isDisplayOn(): Boolean {
+        val dm = appContext.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager ?: return true
+        val display = runCatching { dm.getDisplay(Display.DEFAULT_DISPLAY) }.getOrNull() ?: return true
+        return display.state == Display.STATE_ON
+    }
+
+    /** 亮灭屏状态统一入口：广播与显示监听都走这里，去重后切档并立刻重排下一拍。 */
+    private fun applyScreenState(on: Boolean, source: String) {
+        if (on == screenOn) return
+        screenOn = on
+        val base = TickPolicy.intervalMs(on, 0L, 0L) / 1000
+        Diag.log(TAG, "屏幕${if (on) "亮" else "熄"}（$source）：看门狗节拍 -> ${base} s")
+        main.removeCallbacks(reconcileTick)
+        main.postDelayed(reconcileTick, TickPolicy.TICK_MS)
+    }
+
+    /**
      * 亮灭屏广播（`ACTION_SCREEN_ON/OFF` 只能**动态注册**，好在动态注册不需要任何权限）。
      * 收到就切档并立刻重排下一拍 —— 熄屏后先补快一拍（系统此刻常正在搬窗口），然后再慢下来。
      */
     private val screenStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            val on = intent?.action == Intent.ACTION_SCREEN_ON
-            if (on == screenOn) return
-            screenOn = on
-            val base = TickPolicy.intervalMs(on, 0L, 0L) / 1000
-            Diag.log(TAG, "屏幕${if (on) "亮" else "熄"}：看门狗节拍 -> ${base} s")
-            main.removeCallbacks(reconcileTick)
-            main.postDelayed(reconcileTick, TickPolicy.TICK_MS)
+            applyScreenState(intent?.action == Intent.ACTION_SCREEN_ON, "屏幕广播")
+        }
+    }
+
+    /**
+     * 显示状态监听。**倒置熄屏必须有它**：接近锁关屏时系统不发 `ACTION_SCREEN_OFF`
+     * （那不是电源键睡眠），只有 DisplayManager 会回调 `onDisplayChanged`。
+     */
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId != Display.DEFAULT_DISPLAY) return
+            applyScreenState(isDisplayOn(), "显示状态")
         }
     }
 
@@ -212,8 +257,7 @@ class WorkbenchController(context: Context) {
      */
     private fun startWatchdog(firstDelayMs: Long = TickPolicy.START_DELAY_MS) {
         if (!screenReceiverRegistered) {
-            val pm = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
-            screenOn = pm?.isInteractive ?: true
+            screenOn = isDisplayOn()
             ContextCompat.registerReceiver(
                 appContext,
                 screenStateReceiver,
@@ -223,6 +267,10 @@ class WorkbenchController(context: Context) {
                 },
                 ContextCompat.RECEIVER_NOT_EXPORTED
             )
+            runCatching {
+                (appContext.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+                    ?.registerDisplayListener(displayListener, null)
+            }.onFailure { Diag.log(TAG, "注册显示监听失败：${it.message}") }
             screenReceiverRegistered = true
         }
         lastHeartbeatAt = System.currentTimeMillis()
@@ -275,6 +323,10 @@ class WorkbenchController(context: Context) {
         lastTickAt = System.currentTimeMillis()
         if (screenReceiverRegistered) {
             runCatching { appContext.unregisterReceiver(screenStateReceiver) }
+            runCatching {
+                (appContext.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+                    ?.unregisterDisplayListener(displayListener)
+            }
             screenReceiverRegistered = false
         }
         Diag.log(TAG, "看门狗停拍：$reason")
@@ -480,6 +532,9 @@ class WorkbenchController(context: Context) {
     /** 已经记过一次「因为前景是别的应用而暂不重开」的窗口，避免每拍刷同一行日志。 */
     private val suppressNoted = HashSet<String>()
 
+    /** 本轮熄屏是否已经记过一行「暂停掉线判定」，避免 20 s 一拍刷满日志。 */
+    private var pocketSuppressNoted = false
+
     private fun keyOf(window: LiveWindow) = "${window.packageName}#${window.userId}"
 
     /**
@@ -511,6 +566,14 @@ class WorkbenchController(context: Context) {
      * 更糟的是触发重开。亮屏 2 s 一拍 → 3 拍约 6 s，够慢也够快。
      */
     private fun noteMissing(window: LiveWindow, dump: String) {
+        if (pocketScreenOff()) {
+            if (!pocketSuppressNoted) {
+                pocketSuppressNoted = true
+                Diag.log(TAG, "倒置熄屏中：屏幕已熄灭，暂停掉线判定（不 force-stop、不重开）")
+            }
+            return
+        }
+        if (pocketSuppressNoted) pocketSuppressNoted = false
         val key = keyOf(window)
         val misses = (missTicks[key] ?: 0) + 1
         missTicks[key] = misses
@@ -556,6 +619,20 @@ class WorkbenchController(context: Context) {
         // 把启动过程逐行落盘：分身（--user 999）这条路上出过"报成功但游戏没起来"，
         // 只有看到真正执行的那条 am start 才能判断是命令没带用户号、还是系统把启动丢了。
         outcome.log.forEach { Diag.log(TAG, "    $it") }
+    }
+
+    /**
+     * 倒置熄屏中且屏幕确实灭了？
+     *
+     * 熄屏后（真机 2026-11-26 实测）系统把目标任务的 visibleRequested 置 false、dump 里
+     * 任务行整段消失，而进程还活着、游戏还在算 —— 这时按「连续 3 拍找不到 = 掉线」处理，
+     * 就会 force-stop 掉用户正挂着的游戏。所以熄屏期间既不判定也不重开，
+     * 屏一亮（接近锁自动放屏）立刻恢复正常判定。
+     */
+    private fun pocketScreenOff(): Boolean {
+        if (!state.pocketArmed) return false
+        // 不能用 PowerManager.isInteractive：接近锁下屏幕物理灭了它仍然是 true。
+        return !isDisplayOn()
     }
 
     /** 这一拍找到了：清掉记账；真的从「掉线」回来时还要通知界面。 */

@@ -4,8 +4,11 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
+import android.widget.Toast
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -27,14 +30,18 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationManagerCompat
 import com.miniworld.apps.AppCatalog
 import com.miniworld.data.SceneStore
 import com.miniworld.model.Slot
+import com.miniworld.pocket.PocketClient
 import com.miniworld.service.WorkbenchService
 import com.miniworld.shizuku.ShizukuGateway
 import com.miniworld.shizuku.ShellRunner
@@ -76,11 +83,17 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
     // 上次采集的时刻。必须显示出来：面板展开后不会自己变，不标时间就会被当成"现在"，
     // 实际踩过这个坑——点完启动再回来看，白名单还显示"✗ 不在"，其实设备上早就是 ✓ 了。
     var selfCheckAt by remember { mutableStateOf("") }
+    // 倒置熄屏：invertWanted 是「用户想要」（落盘），pocket.armed 是「锁真的在手里」。
+    // 两个必须分开显示——Shizuku 掉线或 UserService 被杀时锁会没，但用户的意愿还在。
+    var invertWanted by remember { mutableStateOf(store.invertScreenOff()) }
+    val pocket by PocketClient.state.collectAsState()
     val scope = rememberCoroutineScope()
     val shizuku by ShizukuGateway.state.collectAsState()
 
     LaunchedEffect(Unit) {
         ShizukuGateway.refresh(activity.application)
+        // 幂等：WorkbenchService 也会 init，谁先到谁生效
+        PocketClient.init(activity.application)
         options = loadOptions(catalog)
     }
 
@@ -158,7 +171,11 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
         )
 
         Spacer(Modifier.height(24.dp))
-        Button(
+        ActionButton(
+            text = "启动",
+            active = running,
+            caption = if (running) "正在挂机 · 再点是重新拉起"
+            else "挂到后台，缩成看不见的小点",
             onClick = {
                 val target = scene
                 if (target == null || target.slots.isEmpty()) {
@@ -167,29 +184,51 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
                     WorkbenchService.send(activity, WorkbenchService.ACTION_START_SCENE, target.id)
                     activity.moveTaskToBack(true)
                 }
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(64.dp)
-        ) { Text("启动", fontSize = 20.sp) }
+            }
+        )
 
         Spacer(Modifier.height(10.dp))
-        OutlinedButton(
+        ActionButton(
+            text = "关闭",
+            active = false,
+            caption = "撤掉保活并彻底关掉挂机应用",
             onClick = {
                 WorkbenchService.send(activity, WorkbenchService.ACTION_STOP, kill = true)
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-        ) { Text("关闭", fontSize = 16.sp) }
+            }
+        )
 
         Spacer(Modifier.height(10.dp))
-        OutlinedButton(
-            onClick = { pickerOpen = true },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-        ) { Text("更换", fontSize = 16.sp) }
+        ActionButton(
+            text = "倒置熄屏",
+            active = invertWanted,
+            caption = when {
+                !invertWanted -> "开启后扣下手机即熄屏，挂机不停"
+                // 没开工时锁不举着，所以这里只能承诺"记住"，不能写"已开启"
+                !running -> "已记住：下次开工自动开启"
+                pocket.armed -> "已开启：扣下即熄屏，拿起亮屏"
+                else -> pocket.message
+            },
+            onClick = {
+                val next = !invertWanted
+                invertWanted = next
+                store.setInvertScreenOff(next)
+                // 没开工时只记意愿：锁只在挂机期间有意义，空举着会让扣下屏幕变成
+                // 「屏灭了但没事在跑」，白耗电。
+                if (running) {
+                    PocketClient.setArmed(next) { ok, message ->
+                        if (!ok) Toast.makeText(activity, message, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        )
+
+        Spacer(Modifier.height(10.dp))
+        ActionButton(
+            text = "更换",
+            active = false,
+            caption = "换一个挂机应用（含手机分身）",
+            onClick = { pickerOpen = true }
+        )
 
         Spacer(Modifier.height(20.dp))
         Text("权限 / 连接", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -280,6 +319,62 @@ fun WorkbenchRoot(activity: Activity, store: SceneStore, catalog: AppCatalog) {
                 }
             )
         }
+    }
+}
+
+/** 四个动作键统一的高度与标题字号：用户要求「全部和启动一样大」。 */
+private val ACTION_BUTTON_HEIGHT = 64.dp
+private const val ACTION_TITLE_SIZE = 20
+private const val ACTION_CAPTION_SIZE = 11
+
+/**
+ * 主页上的一个动作键：主标题 + 说明小字，两行都排在按钮**里面**、水平居中。
+ *
+ * 颜色规则是用户定的：没生效时是描边键，生效后才变成主题色实心键 —— 一眼就能看出
+ * 哪两项现在是"开着"的（开始挂机、倒置熄屏已开启）。
+ * 说明文字常驻，因为"按下去会发生什么"靠按钮名字看不出来，尤其是倒置熄屏：
+ * 它不改变前台应用，只是让屏幕在被扣住时真的断电，用户第一次见会以为手机坏了。
+ *
+ * 说明只占一行：放不下就在调用处精简字数，超出会被省略号截断（maxLines = 1），
+ * 换行会把按钮撑高、四个键就不再一样大了。
+ */
+@Composable
+private fun ActionButton(
+    text: String,
+    active: Boolean,
+    caption: String,
+    onClick: () -> Unit
+) {
+    val captionColor =
+        if (active) MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.85f)
+        else MaterialTheme.colorScheme.onSurfaceVariant
+    // 标题在按钮里垂直居中，说明贴在最下端、紧挨框线 —— 用户定的排版。
+    // 说明用 BottomCenter 叠在标题下方而不是排成一列，否则标题会被挤到偏上。
+    val content: @Composable () -> Unit = {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text(text, fontSize = ACTION_TITLE_SIZE.sp, lineHeight = 24.sp)
+            Text(
+                caption,
+                fontSize = ACTION_CAPTION_SIZE.sp,
+                lineHeight = 14.sp,
+                color = captionColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+            )
+        }
+    }
+    val modifier = Modifier
+        .fillMaxWidth()
+        .height(ACTION_BUTTON_HEIGHT)
+    // 竖直方向不留内边距，小字才能贴到框线边上
+    val padding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+    if (active) {
+        Button(onClick = onClick, modifier = modifier, contentPadding = padding) { content() }
+    } else {
+        OutlinedButton(onClick = onClick, modifier = modifier, contentPadding = padding) { content() }
     }
 }
 
