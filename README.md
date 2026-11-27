@@ -42,6 +42,46 @@
 
 **明确不做**：应用多开、虚拟屏、游戏加速器、多窗口平铺。整个应用只有一个界面。
 
+### 2.1 倒置熄屏（1.4 新增，重点说清楚）
+
+**效果**：把手机**屏幕朝下扣在桌上**（或塞进口袋），屏幕**真的物理熄灭**（`dumpsys display` 里 `Display State=OFF`，不是黑遮罩、不是把亮度调到 0），但**设备不进睡眠**（`mWakefulness` 保持 `Awake`）、挂机应用继续以 resumed 状态跑、声音不断。**拿起来自动亮屏**，游戏还在原处，不需要任何手势去「退出熄屏」。
+
+**怎么用**（三步，都在首页）：
+
+1. 点「启动」把目标应用挂到屏幕外（和以前一样）；
+2. 点「倒置熄屏」让它变成淡紫色实心 = 已开启。这个开关会**记住上次状态**，下次点「启动」时自动重新开启；
+3. 把手机屏幕朝下扣下（正面贴桌面、或扣在纸上；口袋里贴着大腿也行）——屏幕灭、挂机继续。拿起来就亮。
+
+开关**只在挂机期间**才真的举锁：没开工时它只记意愿（会显示「已记住：下次开工自动开启」），不会让手机一进兜就白白「屏灭但整机全速跑」。
+
+**它是怎么做到的**（关键只有一句话：请 shell 帮你举一把接近传感器关屏锁）：
+
+| 步骤 | 实际发生的事 |
+|---|---|
+| 1 | App 通过 **Shizuku** 拉起一个跑在 **shell（uid=2000）** 身份的 UserService 进程（AIDL 接口 `com.miniworld.pocket.IPocketService`） |
+| 2 | 这个进程反射 `ServiceManager.getService("power")` → `IPowerManager` → 调 `acquireWakeLock(..., flags = 0x20)`，即 `PROXIMITY_SCREEN_OFF_WAKE_LOCK`，tag = `miniworld:pocket` |
+| 3 | 你把手机扣下 / 塞进口袋 → 接近传感器报「被遮挡」→ 系统按这把锁把**屏幕关掉**，但因为这是「传感器关屏」而不是「电源键熄屏」，设备**不进入 doze**，前台应用不会被 pause |
+| 4 | 拿起来 → 传感器报「不再遮挡」→ 锁自动放屏、显示器点亮。App 全程没插手 |
+
+**为什么必须借 shell 的手**：同样一把锁，用 App 自己的 uid 去申请，`dumpsys power` 里会被标成 `DISABLED`（即使前台服务正在跑、`isForeground=true` 也一样），拿不到任何效果；换成 shell（uid=2000）身份申请就是 `ACQ`。这是这台 HyperOS 上实测出来的硬差别——不是文档里写的、也不是可以靠权限声明绕过的。另外末尾的 `uid` 参数必须传 `0`：传 2000 时调用不报错、`acquire` 也返回 true，但锁**根本不会注册**（PowerManagerService 按传入的 uid+包名做 app-op 归属，归属不上就静默丢弃）。
+
+**和「抖音息屏播放」不是一回事**：抖音那是媒体应用**自己**的 `mediaPlayback` 前台服务 + `MediaSession` + 独立音频轨，切到后台后只保留音频通道、把渲染管线拆掉。游戏没有这条通道，第三方也无法替它注入——所以「让任意应用像抖音一样黑屏继续播」在游戏上不成立。须弥芥子走的是另一条：**屏幕关掉，但前台 Activity 仍然是 resumed**，跑的是应用原本的前台逻辑（画面照渲染、只是没人看）。
+
+**代价与边界**（务必看清再开）：
+
+- **省面板不省 CPU**：真机实测熄屏期间目标游戏稳定吃 0.3~0.5 个核（100 秒内 CPU 时间单调上涨、无衰减），整机功耗从「亮屏挂机约 1.4~2.2 W」降到「约 0.5~1.0 W」；但如果拿「电源键熄屏待机 0.05~0.15 W」当基准，它是那个的 5~10 倍。**长时间扣着跑会明显发热**，所以文案里从不写「省电挂机」。
+- **做不到 Doze**：设备不睡是这套方案的前提，想「熄屏后进入深度省电还继续跑」是不可能的。
+- **做不到输入注入**：没有无障碍、没有 root，熄屏后不能替游戏点屏；挂机靠目标应用自己的自动战斗 / 采集逻辑。
+- **依赖真实遮挡**：Android 没有给接近传感器注入数值的接口（数据从 HAL 直进 `SensorService`），软件伪造不了「被盖住」。扣在纸上、桌面、口袋里都行；腾空举着不行。
+- **锁的寿命**：只在挂机期间举着；点「关闭」、收工、或者**须弥芥子进程被系统杀掉**时都会放掉——UserService 里挂了 `linkToDeath`，宿主一死就自己 `releaseWakeLock` 并退出进程，不会留下「屏幕一进兜就灭、整机全速跑」却没人管的幽灵锁。
+- **机型差异**：能不能用取决于该 ROM 允不允许 shell 身份持 `PROXIMITY_SCREEN_OFF`。HyperOS 4 / Android 17 实测可用；别的 ROM 请先按 §10 的探针脚本验证（失败时降级为「开关能点、屏幕不灭」，不会崩）。
+
+**顺带修正的两处看门狗行为**（不开倒置熄屏时完全不受影响）：
+
+- 判「屏幕是否亮着」从 `PowerManager.isInteractive` 改成 `DisplayManager` 的 `Display.STATE_ON`。原因：接近锁下屏幕已经关了，`isInteractive` 仍然是 `true`，用它判会一直走 2 s 快档、白白多跑 10 倍 `dumpsys`。改完熄屏期间自动降到 20 s 一拍。
+- 熄屏期间**暂停掉线判定**：真熄屏会让 `visibleRequested` 变 `false`、任务行在 `dumpsys` 里整段消失，照旧逻辑会「连续 3 拍不可见 → force-stop 重开」，等于每十几秒把正在挂的游戏掐死一次。现在只要「已开启倒置熄屏 + 屏幕是关的」，就只记一行日志、不记账、不重开。
+
+
 ## 3. 依赖了手机 OS 的哪些能力
 
 | 能力 | 实际用的东西 | 为什么必须有 |
@@ -50,7 +90,8 @@
 | 任务 / 窗口状态 | 解析 `dumpsys activity activities` 的 `* Task{...}` 行 | 取窗口矩形、`visible`、`visibleRequested`、`mode=freeform`、`U=0/999`；判断窗口是否被系统搬走 |
 | shell 执行通道 | **Shizuku**：`Shizuku.newProcess("sh","-c",cmd)`（uid 2000） | 上面这些 `am` / `cmd` / `dumpsys` 都要 shell 权限；Shizuku 提供「一次授权、无需 root」的通道 |
 | 悬浮 Dock | `SYSTEM_ALERT_WINDOW` + 前台服务（`specialUse`） | 常驻一条可点的悬浮图标条；同时让编排服务不被回收 |
-| 屏幕开关 | `ACTION_SCREEN_ON` / `ACTION_SCREEN_OFF` + `PowerManager.isInteractive`（**动态注册，不需要权限**） | 熄屏降频、亮屏恢复 2 s 节拍 |
+| 屏幕开关 | `ACTION_SCREEN_ON` / `ACTION_SCREEN_OFF` + `DisplayManager` 的 `Display.STATE_ON`（**动态注册 + `registerDisplayListener`，都不需要权限**） | 熄屏降频、亮屏恢复 2 s 节拍。1.4 起改看 `Display` 状态：倒置熄屏下屏幕已关，但 `PowerManager.isInteractive` 仍是 `true` |
+| 传感器关屏（1.4） | Shizuku UserService 里反射 `IPowerManager.acquireWakeLock`，`PROXIMITY_SCREEN_OFF_WAKE_LOCK`（flags `0x20`），tag `miniworld:pocket` | 第三方 App 身份持这把锁会被系统标 `DISABLED`，只有 shell（uid 2000）身份是 `ACQ`；用来让屏幕真灭而设备不睡（见 §2.1） |
 | 兜底唤醒 | `AlarmManager.setAndAllowWhileIdle`（**不需要权限**） | ROM 把整个进程挂起时，唯一还能从进程外把自己叫醒的通道 |
 | 开机自启 | `BOOT_COMPLETED` / `MY_PACKAGE_REPLACED` | 重启后恢复 Dock（挂机场景仍需手动「启动」） |
 
@@ -69,6 +110,8 @@
 | `VIBRATE` | 普通 | Dock 长按触感反馈 |
 
 > **没有 `INTERNET` 权限**：应用不联网、不上传任何数据。
+
+> 1.4 的「倒置熄屏」**没有新增任何权限**：`WAKE_LOCK` 是拿在 shell 身份的 UserService 里的，App 自己既不申请也不持有。
 
 ## 5. 针对本机调过的参数与对应代码
 
@@ -278,7 +321,8 @@ tools/                              # 构建、探测、验证、发布脚本—
 | `tools/build-apk.bat` / `setup-build-env.ps1` | Windows 上开箱构建 |
 | `tools/release.ps1` / `.cmd` | 一把跑完：版本号 → 编译+单测 → 装机核对 → 快照 → commit → tag |
 | `tools/release-gh.ps1` / `.cmd` | 发 GitHub Release：说明自动取 `docs/版本记录.md` 对应小节，附件取快照里的 APK（`-DryRun` 只看不发，`-Force` 覆盖已发的） |
-| `tools/Push-To-GitHub.cmd` | 一把提交并推送（`git add -A` → commit → `git push origin main --tags`） |
+| `tools/Push-To-GitHub.cmd` | 双击推送：先显示改了什么、要上传哪些提交，**等你按一下回车**，然后才执行 `git add -A` → `git commit` → `git push origin main --tags`（只推一次，失败就停下说明原因，不重试） |
+| `tools/Release-To-GitHub.cmd` | 双击发版：问你要发哪个版本（空 = 最新 tag），**等你确认**，然后创建一个 Release 并上传该版本的 APK（同样只做一次，不重试；已发过的版本会停下提示，加 `-Force` 才会覆盖） |
 | `tools/doc-sync.ps1` / `.cmd` | 按锚点表批量改文档（`路径 \|\|\| 原文 \|\|\| 新文`，支持 `-Check` 只报不改） |
 
 这些 `.cmd` 都放在本仓库自己的 `tools/` 里，靠脚本位置认仓库根（上一级目录），所以换一台机器或另一个项目只要把 `tools/` 一起带走即可。`Push-To-GitHub.cmd` 会先找 `..\..\PortableGit\cmd\git.exe`，找不到再退回 PATH 上的 `git`。
